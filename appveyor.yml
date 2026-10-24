@@ -1,3 +1,4 @@
+
 image: Visual Studio 2022
 clone_depth: 1
 skip_branch_with_pr: false
@@ -7,52 +8,151 @@ environment:
   MOD_NAME: "DetailArmorBarBedrock"
 
 install:
-  - ps: choco install xmake -y
-  - ps: choco install llvm -y
-  - ps: $env:Path = $env:Path + ";C:\Program Files\LLVM\bin"
-  - ps: xmake --version
-  - ps: clang-cl --version
+  - ps: |
+      $ErrorActionPreference = 'Stop'
+
+      choco install xmake -y --no-progress
+      if ($LASTEXITCODE -ne 0) {
+          throw "Chocolatey gagal memasang XMake."
+      }
+
+      choco install llvm -y --no-progress
+      if ($LASTEXITCODE -ne 0) {
+          throw "Chocolatey gagal memasang LLVM."
+      }
+
+      # Cari XMake, karena PATH tidak selalu diperbarui
+      # setelah Chocolatey memasang program.
+      $candidates = @(
+          'C:\Program Files\xmake\xmake.exe',
+          'C:\Program Files (x86)\xmake\xmake.exe',
+          'C:\ProgramData\chocolatey\bin\xmake.exe'
+      )
+
+      $xmakeExe = $null
+
+      $cmd = Get-Command xmake.exe -ErrorAction SilentlyContinue
+      if ($cmd) {
+          $xmakeExe = $cmd.Source
+      }
+
+      if (-not $xmakeExe) {
+          foreach ($candidate in $candidates) {
+              if (Test-Path $candidate) {
+                  $xmakeExe = $candidate
+                  break
+              }
+          }
+      }
+
+      if (-not $xmakeExe) {
+          throw "xmake.exe tidak ditemukan setelah instalasi."
+      }
+
+      $xmakeDir = Split-Path $xmakeExe -Parent
+      $env:Path = "$xmakeDir;$env:Path"
+      $env:Path = "C:\Program Files\LLVM\bin;$env:Path"
+
+      # Simpan lokasi executable agar tahap build
+      # dapat memanggil XMake secara langsung.
+      Set-Content -Path "$env:APPVEYOR_BUILD_FOLDER\xmake-path.txt" `
+          -Value $xmakeExe -Encoding ASCII
+
+      Write-Host "XMake executable: $xmakeExe"
+      & $xmakeExe --version
+      if ($LASTEXITCODE -ne 0) {
+          throw "XMake gagal dijalankan."
+      }
+
+      clang-cl --version
+      if ($LASTEXITCODE -ne 0) {
+          throw "clang-cl tidak ditemukan atau gagal dijalankan."
+      }
 
 build_script:
   - ps: |
       $ErrorActionPreference = 'Stop'
-      $env:Path = $env:Path + ';C:\Program Files\LLVM\bin'
-      xmake f -y -p windows -a x64 -m release --target_type=client
-      if ($LASTEXITCODE -ne 0) { throw "xmake configuration failed ($LASTEXITCODE)" }
 
-      xmake build FeatureLogicTests
-      if ($LASTEXITCODE -ne 0) { throw "FeatureLogicTests build failed ($LASTEXITCODE)" }
-      xmake run FeatureLogicTests
-      if ($LASTEXITCODE -ne 0) { throw "FeatureLogicTests failed ($LASTEXITCODE)" }
+      $xmakeFile = Join-Path $env:APPVEYOR_BUILD_FOLDER 'xmake-path.txt'
+      if (-not (Test-Path $xmakeFile)) {
+          throw "File lokasi XMake tidak ditemukan."
+      }
 
-      xmake build DetailArmorBarBedrock
-      if ($LASTEXITCODE -ne 0) { throw "LeviLamina client build failed ($LASTEXITCODE)" }
+      $xmakeExe = (Get-Content $xmakeFile -Raw).Trim()
+      if (-not (Test-Path $xmakeExe)) {
+          throw "XMake tidak ditemukan di lokasi: $xmakeExe"
+      }
 
+      $env:Path = "$(Split-Path $xmakeExe -Parent);C:\Program Files\LLVM\bin;$env:Path"
+
+      # Konfigurasi target Windows x64.
+      & $xmakeExe f -y -p windows -a x64 -m release --target_type=client
+      if ($LASTEXITCODE -ne 0) {
+          throw "XMake configuration failed ($LASTEXITCODE)"
+      }
+
+      # Build dan jalankan unit test.
+      & $xmakeExe build FeatureLogicTests
+      if ($LASTEXITCODE -ne 0) {
+          throw "FeatureLogicTests build failed ($LASTEXITCODE)"
+      }
+
+      & $xmakeExe run FeatureLogicTests
+      if ($LASTEXITCODE -ne 0) {
+          throw "FeatureLogicTests failed ($LASTEXITCODE)"
+      }
+
+      # Build DLL mod LeviLamina.
+      & $xmakeExe build DetailArmorBarBedrock
+      if ($LASTEXITCODE -ne 0) {
+          throw "LeviLamina client build failed ($LASTEXITCODE)"
+      }
+
+      # Pastikan DLL benar-benar dihasilkan.
       $dll = Get-ChildItem -Path . -Filter 'DetailArmorBarBedrock.dll' -Recurse |
-        Where-Object { $_.FullName -notmatch '\\dist\\' } |
-        Select-Object -First 1
-      if (-not $dll) { throw 'Build completed but DetailArmorBarBedrock.dll was not found; inspect xmake/modpacker output.' }
+          Where-Object { $_.FullName -notmatch '\\dist\\' } |
+          Select-Object -First 1
 
-      $dist = Join-Path (Get-Location) 'dist'
+      if (-not $dll) {
+          throw "DLL tidak ditemukan setelah build."
+      }
+
+      # Siapkan artifact.
+      $dist = Join-Path $env:APPVEYOR_BUILD_FOLDER 'dist'
       New-Item -ItemType Directory -Force -Path $dist | Out-Null
-      Copy-Item $dll.FullName (Join-Path $dist 'DetailArmorBarBedrock.dll') -Force
+
+      Copy-Item $dll.FullName `
+          (Join-Path $dist 'DetailArmorBarBedrock.dll') -Force
+
       Copy-Item 'README.md' $dist -Force
       Copy-Item 'LICENSE' $dist -Force
-      New-Item -ItemType Directory -Force -Path (Join-Path $dist 'resources') | Out-Null
-      Copy-Item 'resources/java-reference/textures' (Join-Path $dist 'resources') -Recurse -Force
-      @{
-        name = 'DetailArmorBarBedrock'
-        entry = 'DetailArmorBarBedrock.dll'
-        version = '0.2.0-dev'
-        type = 'native'
-        platform = 'windows'
-      } | ConvertTo-Json | Set-Content (Join-Path $dist 'manifest.json') -Encoding UTF8
 
-      Compress-Archive -Path (Join-Path $dist '*') -DestinationPath 'DetailArmorBarBedrock-client-windows-x64.zip' -Force
+      $textureSource = 'resources/java-reference/textures'
+      if (Test-Path $textureSource) {
+          New-Item -ItemType Directory -Force `
+              -Path (Join-Path $dist 'resources') | Out-Null
+
+          Copy-Item $textureSource `
+              (Join-Path $dist 'resources') -Recurse -Force
+      }
+
+      @{
+          name    = 'DetailArmorBarBedrock'
+          entry   = 'DetailArmorBarBedrock.dll'
+          version = '0.2.0-dev'
+          type    = 'native'
+          platform = 'windows'
+      } | ConvertTo-Json |
+          Set-Content (Join-Path $dist 'manifest.json') -Encoding UTF8
+
+      Compress-Archive `
+          -Path (Join-Path $dist '*') `
+          -DestinationPath 'DetailArmorBarBedrock-client-windows-x64.zip' `
+          -Force
 
 artifacts:
   - path: DetailArmorBarBedrock-client-windows-x64.zip
     name: DetailArmorBarBedrock-client-windows-x64
+
   - path: dist\DetailArmorBarBedrock.dll
     name: Native DLL (development build)
-
