@@ -1,0 +1,58 @@
+image: Visual Studio 2022
+clone_depth: 1
+skip_branch_with_pr: false
+
+environment:
+  TARGET_VERSION: "26.51.1"
+  MOD_NAME: "DetailArmorBarBedrock"
+
+install:
+  - ps: choco install xmake -y
+  - ps: choco install llvm -y
+  - ps: $env:Path = $env:Path + ";C:\Program Files\LLVM\bin"
+  - ps: xmake --version
+  - ps: clang-cl --version
+
+build_script:
+  - ps: |
+      $ErrorActionPreference = 'Stop'
+      $env:Path = $env:Path + ';C:\Program Files\LLVM\bin'
+      xmake f -y -p windows -a x64 -m release --target_type=client
+      if ($LASTEXITCODE -ne 0) { throw "xmake configuration failed ($LASTEXITCODE)" }
+
+      xmake build FeatureLogicTests
+      if ($LASTEXITCODE -ne 0) { throw "FeatureLogicTests build failed ($LASTEXITCODE)" }
+      xmake run FeatureLogicTests
+      if ($LASTEXITCODE -ne 0) { throw "FeatureLogicTests failed ($LASTEXITCODE)" }
+
+      xmake build DetailArmorBarBedrock
+      if ($LASTEXITCODE -ne 0) { throw "LeviLamina client build failed ($LASTEXITCODE)" }
+
+      $dll = Get-ChildItem -Path . -Filter 'DetailArmorBarBedrock.dll' -Recurse |
+        Where-Object { $_.FullName -notmatch '\\dist\\' } |
+        Select-Object -First 1
+      if (-not $dll) { throw 'Build completed but DetailArmorBarBedrock.dll was not found; inspect xmake/modpacker output.' }
+
+      $dist = Join-Path (Get-Location) 'dist'
+      New-Item -ItemType Directory -Force -Path $dist | Out-Null
+      Copy-Item $dll.FullName (Join-Path $dist 'DetailArmorBarBedrock.dll') -Force
+      Copy-Item 'README.md' $dist -Force
+      Copy-Item 'LICENSE' $dist -Force
+      New-Item -ItemType Directory -Force -Path (Join-Path $dist 'resources') | Out-Null
+      Copy-Item 'resources/java-reference/textures' (Join-Path $dist 'resources') -Recurse -Force
+      @{
+        name = 'DetailArmorBarBedrock'
+        entry = 'DetailArmorBarBedrock.dll'
+        version = '0.2.0-dev'
+        type = 'native'
+        platform = 'windows'
+      } | ConvertTo-Json | Set-Content (Join-Path $dist 'manifest.json') -Encoding UTF8
+
+      Compress-Archive -Path (Join-Path $dist '*') -DestinationPath 'DetailArmorBarBedrock-client-windows-x64.zip' -Force
+
+artifacts:
+  - path: DetailArmorBarBedrock-client-windows-x64.zip
+    name: DetailArmorBarBedrock-client-windows-x64
+  - path: dist\DetailArmorBarBedrock.dll
+    name: Native DLL (development build)
+
