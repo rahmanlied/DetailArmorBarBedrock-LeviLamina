@@ -21,20 +21,13 @@ install:
           throw "Chocolatey gagal memasang LLVM."
       }
 
-      # Cari XMake, karena PATH tidak selalu diperbarui
-      # setelah Chocolatey memasang program.
       $candidates = @(
           'C:\Program Files\xmake\xmake.exe',
           'C:\Program Files (x86)\xmake\xmake.exe',
           'C:\ProgramData\chocolatey\bin\xmake.exe'
       )
 
-      $xmakeExe = $null
-
-      $cmd = Get-Command xmake.exe -ErrorAction SilentlyContinue
-      if ($cmd) {
-          $xmakeExe = $cmd.Source
-      }
+      $xmakeExe = (Get-Command xmake.exe -ErrorAction SilentlyContinue).Source
 
       if (-not $xmakeExe) {
           foreach ($candidate in $candidates) {
@@ -46,19 +39,16 @@ install:
       }
 
       if (-not $xmakeExe) {
-          throw "xmake.exe tidak ditemukan setelah instalasi."
+          throw "xmake.exe tidak ditemukan."
       }
 
-      $xmakeDir = Split-Path $xmakeExe -Parent
-      $env:Path = "$xmakeDir;$env:Path"
-      $env:Path = "C:\Program Files\LLVM\bin;$env:Path"
+      $env:Path = "$(Split-Path $xmakeExe -Parent);C:\Program Files\LLVM\bin;$env:Path"
 
-      # Simpan lokasi executable agar tahap build
-      # dapat memanggil XMake secara langsung.
-      Set-Content -Path "$env:APPVEYOR_BUILD_FOLDER\xmake-path.txt" `
-          -Value $xmakeExe -Encoding ASCII
+      Set-Content `
+          -Path "$env:APPVEYOR_BUILD_FOLDER\xmake-path.txt" `
+          -Value $xmakeExe `
+          -Encoding ASCII
 
-      Write-Host "XMake executable: $xmakeExe"
       & $xmakeExe --version
       if ($LASTEXITCODE -ne 0) {
           throw "XMake gagal dijalankan."
@@ -66,7 +56,7 @@ install:
 
       clang-cl --version
       if ($LASTEXITCODE -ne 0) {
-          throw "clang-cl tidak ditemukan atau gagal dijalankan."
+          throw "clang-cl gagal dijalankan."
       }
 
 build_script:
@@ -79,19 +69,13 @@ build_script:
       }
 
       $xmakeExe = (Get-Content $xmakeFile -Raw).Trim()
-      if (-not (Test-Path $xmakeExe)) {
-          throw "XMake tidak ditemukan di lokasi: $xmakeExe"
-      }
-
       $env:Path = "$(Split-Path $xmakeExe -Parent);C:\Program Files\LLVM\bin;$env:Path"
 
-      # Konfigurasi target Windows x64.
       & $xmakeExe f -y -p windows -a x64 -m release --target_type=client
       if ($LASTEXITCODE -ne 0) {
           throw "XMake configuration failed ($LASTEXITCODE)"
       }
 
-      # Build dan jalankan unit test.
       & $xmakeExe build FeatureLogicTests
       if ($LASTEXITCODE -ne 0) {
           throw "FeatureLogicTests build failed ($LASTEXITCODE)"
@@ -102,13 +86,11 @@ build_script:
           throw "FeatureLogicTests failed ($LASTEXITCODE)"
       }
 
-      # Build DLL mod LeviLamina.
       & $xmakeExe build DetailArmorBarBedrock
       if ($LASTEXITCODE -ne 0) {
           throw "LeviLamina client build failed ($LASTEXITCODE)"
       }
 
-      # Pastikan DLL benar-benar dihasilkan.
       $dll = Get-ChildItem -Path . -Filter 'DetailArmorBarBedrock.dll' -Recurse |
           Where-Object { $_.FullName -notmatch '\\dist\\' } |
           Select-Object -First 1
@@ -117,7 +99,6 @@ build_script:
           throw "DLL tidak ditemukan setelah build."
       }
 
-      # Siapkan artifact.
       $dist = Join-Path $env:APPVEYOR_BUILD_FOLDER 'dist'
       New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
@@ -137,10 +118,10 @@ build_script:
       }
 
       @{
-          name    = 'DetailArmorBarBedrock'
-          entry   = 'DetailArmorBarBedrock.dll'
+          name = 'DetailArmorBarBedrock'
+          entry = 'DetailArmorBarBedrock.dll'
           version = '0.2.0-dev'
-          type    = 'native'
+          type = 'native'
           platform = 'windows'
       } | ConvertTo-Json |
           Set-Content (Join-Path $dist 'manifest.json') -Encoding UTF8
@@ -150,9 +131,49 @@ build_script:
           -DestinationPath 'DetailArmorBarBedrock-client-windows-x64.zip' `
           -Force
 
+on_failure:
+  - ps: |
+      $ErrorActionPreference = 'Continue'
+
+      $diag = Join-Path $env:APPVEYOR_BUILD_FOLDER 'diagnostics'
+      New-Item -ItemType Directory -Force -Path $diag | Out-Null
+
+      $logPaths = @(
+          "$env:LOCALAPPDATA\.xmake\cache\packages\2610\m\mimalloc\v3.5.0\installdir.failed\logs\install.txt",
+          "$env:LOCALAPPDATA\.xmake\cache\packages\2610\l\levilamina\v26.51.1\installdir.failed\logs\install.txt"
+      )
+
+      foreach ($logPath in $logPaths) {
+          if (Test-Path $logPath) {
+              $name = if ($logPath -match '\\mimalloc\\') {
+                  'mimalloc-install.txt'
+              } else {
+                  'levilamina-install.txt'
+              }
+
+              Copy-Item $logPath (Join-Path $diag $name) -Force
+          }
+      }
+
+      $cacheRoot = "$env:LOCALAPPDATA\.xmake\cache\packages"
+      if (Test-Path $cacheRoot) {
+          Get-ChildItem $cacheRoot -Filter 'install.txt' -Recurse -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match '\\(mimalloc|levilamina|demangler)\\'
+              } |
+              Select-Object -First 20 |
+              ForEach-Object {
+                  $safeName = ($_.FullName -replace '[\\/:*?"<>|]', '_')
+                  Copy-Item $_.FullName (Join-Path $diag $safeName) -Force
+              }
+      }
+
 artifacts:
   - path: DetailArmorBarBedrock-client-windows-x64.zip
     name: DetailArmorBarBedrock-client-windows-x64
 
   - path: dist\DetailArmorBarBedrock.dll
     name: Native DLL (development build)
+
+  - path: diagnostics\**
+    name: Build diagnostics
