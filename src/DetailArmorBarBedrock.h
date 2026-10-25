@@ -1,9 +1,9 @@
 #pragma once
 
 #include "config/ArmorBarConfig.h"
+#include "ll/api/mod/NativeMod.h"
 
 #include <filesystem>
-#include <ll/api/mod/NativeMod.h>
 
 namespace dab::bedrock {
 
