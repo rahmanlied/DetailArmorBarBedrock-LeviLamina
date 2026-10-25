@@ -3,10 +3,9 @@
 #include "ll/api/mod/RegisterHelper.h"
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/input/KeyInputEvent.h"
-#include "mc/client/input/HIDController.h"
+#include "ll/api/service/Bedrock.h"
 
-#include "mc/client/game/ClientInstance.h"
-#include "mc/client/player/LocalPlayer.h"
+#include "mc/world/level/Level.h"
 
 #include "ui/SettingsMenu.h"
 #include "render/ArmorHudRenderer.h"
@@ -100,8 +99,15 @@ bool DetailArmorBarBedrock::enable() {
 
                     f8Held = true;
 
-                    auto* player =
-                        event.controller().getLocalPlayer();
+                    // Do not call event.controller():
+                    // HIDController is an incomplete type here.
+                    auto level = ll::service::bedrock::getLevel();
+
+                    if (!level) {
+                        return;
+                    }
+
+                    auto* player = level->getPrimaryLocalPlayer();
 
                     if (player == nullptr) {
                         return;
