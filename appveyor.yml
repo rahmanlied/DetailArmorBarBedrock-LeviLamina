@@ -2,16 +2,22 @@ image: Visual Studio 2022
 clone_depth: 1
 skip_branch_with_pr: false
 
+cache:
+  - .ci-tools
+  - '%LOCALAPPDATA%\.xmake\packages -> xmake.lua'
+  - '%LOCALAPPDATA%\.xmake\cache -> xmake.lua'
+
 environment:
   TARGET_VERSION: "26.51.1"
   MOD_NAME: "DetailArmorBarBedrock"
+  APPVEYOR_SAVE_CACHE_ON_ERROR: "true"
 
 install:
   - ps: |
       $ErrorActionPreference = 'Stop'
 
-      # Gunakan rilis resmi XMake 3.1.1.
-      $toolsDir = Join-Path $env:APPVEYOR_BUILD_FOLDER '.ci-tools'
+      $repo = $env:APPVEYOR_BUILD_FOLDER
+      $toolsDir = Join-Path $repo '.ci-tools'
       $xmakeDir = Join-Path $toolsDir 'xmake'
       $zipPath = Join-Path $toolsDir 'xmake-v3.1.1.win64.zip'
 
@@ -19,97 +25,204 @@ install:
           Out-Null
 
       $xmakeUrl = 'https://github.com/xmake-io/xmake/releases/download/v3.1.1/xmake-v3.1.1.win64.zip'
-
-      Invoke-WebRequest `
-          -Uri $xmakeUrl `
-          -OutFile $zipPath `
-          -UseBasicParsing
-
-      # Verifikasi SHA-256 berdasarkan rilis resmi.
       $expectedHash = '33fdf2f34a0e45fa731c000d59590d27b13dec7011f69cbf575004ed9279b4a2'
-      $actualHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
-      # Tetap validasi ukuran unduhan dan gunakan hash resmi
-      # jika berbeda, hentikan build agar file tidak dieksekusi.
-      if ($actualHash -ne $expectedHash) {
-          Write-Host "Hash ZIP yang terunduh: $actualHash"
-          throw "Hash XMake tidak cocok. Periksa hash pada halaman rilis resmi sebelum melanjutkan."
+      # Periksa ZIP dari cache terlebih dahulu.
+      $downloadXmake = $true
+
+      if (Test-Path -LiteralPath $zipPath) {
+          $cachedHash = (
+              Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
+          if ($cachedHash -eq $expectedHash) {
+              Write-Host 'XMake ZIP ditemukan di cache dan hash valid.'
+              $downloadXmake = $false
+          }
+          else {
+              Write-Host 'Hash ZIP di cache tidak cocok. Mengunduh ulang.'
+              Remove-Item -LiteralPath $zipPath -Force
+          }
       }
 
-      Expand-Archive `
-          -LiteralPath $zipPath `
-          -DestinationPath $xmakeDir `
-          -Force
+      if ($downloadXmake) {
+          Write-Host 'Mengunduh XMake 3.1.1...'
 
+          Invoke-WebRequest `
+              -Uri $xmakeUrl `
+              -OutFile $zipPath `
+              -UseBasicParsing
+
+          $downloadedHash = (
+              Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
+          if ($downloadedHash -ne $expectedHash) {
+              Remove-Item -LiteralPath $zipPath -Force `
+                  -ErrorAction SilentlyContinue
+
+              throw "Hash XMake tidak cocok: $downloadedHash"
+          }
+      }
+
+      # Gunakan hasil ekstraksi dari cache jika masih valid.
       $xmakeFile = Get-ChildItem `
           -LiteralPath $xmakeDir `
           -Filter 'xmake.exe' `
           -File `
-          -Recurse |
+          -Recurse `
+          -ErrorAction SilentlyContinue |
           Select-Object -First 1
 
       if (-not $xmakeFile) {
-          throw "xmake.exe tidak ditemukan dalam arsip XMake."
+          Write-Host 'Ekstraksi XMake diperlukan.'
+
+          if (Test-Path -LiteralPath $xmakeDir) {
+              Remove-Item -LiteralPath $xmakeDir `
+                  -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path $xmakeDir |
+              Out-Null
+
+          Expand-Archive `
+              -LiteralPath $zipPath `
+              -DestinationPath $xmakeDir `
+              -Force
+
+          $xmakeFile = Get-ChildItem `
+              -LiteralPath $xmakeDir `
+              -Filter 'xmake.exe' `
+              -File `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+      }
+
+      if (-not $xmakeFile) {
+          throw 'xmake.exe tidak ditemukan setelah ekstraksi.'
       }
 
       $xmakeExe = $xmakeFile.FullName
+      $xmakeBin = Split-Path $xmakeExe -Parent
 
       Set-Content `
-          -Path (Join-Path $env:APPVEYOR_BUILD_FOLDER 'xmake-path.txt') `
+          -Path (Join-Path $repo 'xmake-path.txt') `
           -Value $xmakeExe `
           -Encoding ASCII
 
-      $env:Path = "$(Split-Path $xmakeExe -Parent);$env:Path"
+      $env:Path = "$xmakeBin;$env:Path"
 
+      Write-Host '========== XMAKE VERSION =========='
       & $xmakeExe --version
+
       if ($LASTEXITCODE -ne 0) {
-          throw "XMake gagal dijalankan."
+          throw 'XMake gagal dijalankan.'
       }
 
-      # LLVM/clang-cl untuk kompilasi Windows.
-      choco install llvm -y --no-progress
-      if ($LASTEXITCODE -ne 0) {
-          throw "Chocolatey gagal memasang LLVM."
+      # Gunakan LLVM yang sudah terpasang pada image AppVeyor.
+      # Tidak menjalankan Chocolatey agar tidak mengunduh LLVM
+      # berukuran besar pada setiap build.
+      $clangPath = $null
+
+      $clangCommand = Get-Command clang-cl.exe `
+          -ErrorAction SilentlyContinue
+
+      if ($clangCommand) {
+          $clangPath = $clangCommand.Source
       }
 
-      $env:Path = "C:\Program Files\LLVM\bin;$env:Path"
+      if (-not $clangPath) {
+          $clangCandidates = @(
+              (Join-Path $env:ProgramFiles 'LLVM\bin\clang-cl.exe'),
+              'C:\Program Files (x86)\LLVM\bin\clang-cl.exe',
+              'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\bin\clang-cl.exe'
+          )
 
-      clang-cl --version
-      if ($LASTEXITCODE -ne 0) {
-          throw "clang-cl gagal dijalankan."
+          foreach ($candidate in $clangCandidates) {
+              if (Test-Path -LiteralPath $candidate) {
+                  $clangPath = $candidate
+                  break
+              }
+          }
       }
+
+      if (-not $clangPath) {
+          throw @"
+      clang-cl.exe tidak ditemukan pada image AppVeyor.
+      Build dihentikan tanpa menjalankan Chocolatey atau mengunduh LLVM.
+      Periksa software yang tersedia pada image Visual Studio 2022.
+      "@
+      }
+
+      $llvmBin = Split-Path $clangPath -Parent
+
+      Set-Content `
+          -Path (Join-Path $repo 'llvm-bin-path.txt') `
+          -Value $llvmBin `
+          -Encoding ASCII
+
+      $env:Path = "$llvmBin;$env:Path"
+
+      Write-Host '========== CLANG VERSION =========='
+      & $clangPath --version
+
+      if ($LASTEXITCODE -ne 0) {
+          throw 'clang-cl gagal dijalankan.'
+      }
+
+      Write-Host 'Toolchain berhasil diperiksa.'
 
 build_script:
   - ps: |
       $ErrorActionPreference = 'Stop'
 
       $repo = $env:APPVEYOR_BUILD_FOLDER
-      $xmakeFile = Join-Path $repo 'xmake-path.txt'
 
-      if (-not (Test-Path $xmakeFile)) {
-          throw "File xmake-path.txt tidak ditemukan."
+      # Muat lokasi XMake dari proses install.
+      $xmakePathFile = Join-Path $repo 'xmake-path.txt'
+
+      if (-not (Test-Path -LiteralPath $xmakePathFile)) {
+          throw 'File xmake-path.txt tidak ditemukan.'
       }
 
-      $xmakeExe = (Get-Content $xmakeFile -Raw).Trim()
+      $xmakeExe = (Get-Content -LiteralPath $xmakePathFile -Raw).Trim()
 
-      if (-not (Test-Path $xmakeExe)) {
+      if (-not (Test-Path -LiteralPath $xmakeExe)) {
           throw "XMake tidak ditemukan: $xmakeExe"
       }
 
-      $env:Path = "$(Split-Path $xmakeExe -Parent);C:\Program Files\LLVM\bin;$env:Path"
+      # Muat lokasi LLVM yang sudah diperiksa saat install.
+      $llvmPathFile = Join-Path $repo 'llvm-bin-path.txt'
 
+      if (-not (Test-Path -LiteralPath $llvmPathFile)) {
+          throw 'File llvm-bin-path.txt tidak ditemukan.'
+      }
+
+      $llvmBin = (Get-Content -LiteralPath $llvmPathFile -Raw).Trim()
+      $clangPath = Join-Path $llvmBin 'clang-cl.exe'
+
+      if (-not (Test-Path -LiteralPath $clangPath)) {
+          throw "clang-cl.exe tidak ditemukan: $clangPath"
+      }
+
+      $env:Path = "$(Split-Path $xmakeExe -Parent);$llvmBin;$env:Path"
+
+      # Folder diagnostik.
       $diag = Join-Path $repo 'diagnostics'
+
       New-Item -ItemType Directory -Force -Path $diag |
           Out-Null
 
-      # Temukan dan tampilkan log internal dependensi yang gagal.
+      # Fungsi untuk menampilkan log instalasi dependency
+      # jika konfigurasi XMake gagal.
       function Show-PackageDiagnostics {
           $cacheRoot = Join-Path $env:LOCALAPPDATA '.xmake\cache\packages'
 
           Write-Host ''
           Write-Host '========== INTERNAL XMAKE PACKAGE DIAGNOSTICS =========='
 
-          if (-not (Test-Path $cacheRoot)) {
+          if (-not (Test-Path -LiteralPath $cacheRoot)) {
               Write-Host "Folder cache XMake tidak ditemukan: $cacheRoot"
               return
           }
@@ -135,7 +248,10 @@ build_script:
           }
 
           foreach ($file in $logs) {
-              $relativePath = $file.FullName.Substring($cacheRoot.Length).TrimStart('\')
+              $relativePath = $file.FullName.Substring(
+                  $cacheRoot.Length
+              ).TrimStart('\')
+
               $safeName = $relativePath -replace '[\\/:*?"<>|]', '_'
               $destination = Join-Path $diag $safeName
 
@@ -160,14 +276,16 @@ build_script:
                       Write-Host $_
                   }
 
-              Write-Host "========== END LOG =========="
+              Write-Host '========== END LOG =========='
           }
 
           Write-Host '========== END PACKAGE DIAGNOSTICS =========='
       }
 
-      # Konfigurasikan mod untuk Windows x64 client.
+      # Konfigurasi target Windows x64 client.
       $configLog = Join-Path $diag 'xmake-config.log'
+
+      Write-Host '========== XMAKE CONFIGURATION =========='
 
       & $xmakeExe f -y -p windows -a x64 -m release --target_type=client 2>&1 |
           Tee-Object -FilePath $configLog
@@ -176,39 +294,52 @@ build_script:
 
       if ($configExitCode -ne 0) {
           Show-PackageDiagnostics
-          throw "XMake configuration failed ($configExitCode). Baca log diagnostik di atas."
+          throw "XMake configuration failed ($configExitCode)."
       }
 
-      # Build dan jalankan unit test.
+      # Build unit tests.
       $testBuildLog = Join-Path $diag 'feature-tests-build.log'
+
+      Write-Host '========== BUILD FEATURE TESTS =========='
 
       & $xmakeExe build FeatureLogicTests 2>&1 |
           Tee-Object -FilePath $testBuildLog
 
-      if ($LASTEXITCODE -ne 0) {
-          throw "FeatureLogicTests build failed. Periksa diagnostics/feature-tests-build.log."
+      $testBuildExitCode = $LASTEXITCODE
+
+      if ($testBuildExitCode -ne 0) {
+          throw 'FeatureLogicTests build failed. Periksa diagnostics/feature-tests-build.log.'
       }
 
+      # Jalankan unit tests.
       $testRunLog = Join-Path $diag 'feature-tests-run.log'
+
+      Write-Host '========== RUN FEATURE TESTS =========='
 
       & $xmakeExe run FeatureLogicTests 2>&1 |
           Tee-Object -FilePath $testRunLog
 
-      if ($LASTEXITCODE -ne 0) {
-          throw "FeatureLogicTests failed. Periksa diagnostics/feature-tests-run.log."
+      $testRunExitCode = $LASTEXITCODE
+
+      if ($testRunExitCode -ne 0) {
+          throw 'FeatureLogicTests failed. Periksa diagnostics/feature-tests-run.log.'
       }
 
       # Build DLL mod LeviLamina.
       $modBuildLog = Join-Path $diag 'mod-build.log'
 
+      Write-Host '========== BUILD DETAIL ARMOR BAR MOD =========='
+
       & $xmakeExe build DetailArmorBarBedrock 2>&1 |
           Tee-Object -FilePath $modBuildLog
 
-      if ($LASTEXITCODE -ne 0) {
-          throw "LeviLamina client build failed. Periksa diagnostics/mod-build.log."
+      $modBuildExitCode = $LASTEXITCODE
+
+      if ($modBuildExitCode -ne 0) {
+          throw 'LeviLamina client build failed. Periksa diagnostics/mod-build.log.'
       }
 
-      # Pastikan DLL benar-benar dihasilkan.
+      # Cari DLL hasil build.
       $dll = Get-ChildItem `
           -Path $repo `
           -Filter 'DetailArmorBarBedrock.dll' `
@@ -220,11 +351,12 @@ build_script:
           Select-Object -First 1
 
       if (-not $dll) {
-          throw "Build selesai tetapi DetailArmorBarBedrock.dll tidak ditemukan."
+          throw 'Build selesai tetapi DetailArmorBarBedrock.dll tidak ditemukan.'
       }
 
-      # Siapkan paket hasil build.
+      # Siapkan folder distribusi.
       $dist = Join-Path $repo 'dist'
+
       New-Item -ItemType Directory -Force -Path $dist |
           Out-Null
 
@@ -233,13 +365,30 @@ build_script:
           -Destination (Join-Path $dist 'DetailArmorBarBedrock.dll') `
           -Force
 
-      Copy-Item 'README.md' $dist -Force
-      Copy-Item 'LICENSE' $dist -Force
+      if (-not (Test-Path (Join-Path $repo 'README.md'))) {
+          throw 'README.md tidak ditemukan.'
+      }
 
+      if (-not (Test-Path (Join-Path $repo 'LICENSE'))) {
+          throw 'LICENSE tidak ditemukan.'
+      }
+
+      Copy-Item `
+          -LiteralPath (Join-Path $repo 'README.md') `
+          -Destination $dist `
+          -Force
+
+      Copy-Item `
+          -LiteralPath (Join-Path $repo 'LICENSE') `
+          -Destination $dist `
+          -Force
+
+      # Sertakan referensi tekstur Java jika tersedia.
       $textureSource = Join-Path $repo 'resources/java-reference/textures'
 
-      if (Test-Path $textureSource) {
+      if (Test-Path -LiteralPath $textureSource) {
           $resources = Join-Path $dist 'resources'
+
           New-Item -ItemType Directory -Force -Path $resources |
               Out-Null
 
@@ -250,19 +399,34 @@ build_script:
               -Force
       }
 
+      # Manifest paket mod.
       @{
           name = 'DetailArmorBarBedrock'
           entry = 'DetailArmorBarBedrock.dll'
           version = '0.2.0-dev'
           type = 'native'
           platform = 'windows'
-      } | ConvertTo-Json |
-          Set-Content (Join-Path $dist 'manifest.json') -Encoding UTF8
+      } |
+          ConvertTo-Json |
+          Set-Content `
+              -Path (Join-Path $dist 'manifest.json') `
+              -Encoding UTF8
+
+      # Buat ZIP distribusi.
+      $zipOutput = Join-Path $repo 'DetailArmorBarBedrock-client-windows-x64.zip'
+
+      if (Test-Path -LiteralPath $zipOutput) {
+          Remove-Item -LiteralPath $zipOutput -Force
+      }
 
       Compress-Archive `
           -Path (Join-Path $dist '*') `
-          -DestinationPath (Join-Path $repo 'DetailArmorBarBedrock-client-windows-x64.zip') `
+          -DestinationPath $zipOutput `
           -Force
+
+      Write-Host '========== BUILD SUCCEEDED =========='
+      Write-Host "DLL: $($dll.FullName)"
+      Write-Host "ZIP: $zipOutput"
 
 artifacts:
   - path: DetailArmorBarBedrock-client-windows-x64.zip
