@@ -121,8 +121,7 @@ install:
       }
 
       # Gunakan LLVM yang sudah terpasang pada image AppVeyor.
-      # Tidak menjalankan Chocolatey agar tidak mengunduh LLVM
-      # berukuran besar pada setiap build.
+      # Tidak mengunduh LLVM melalui Chocolatey.
       $clangPath = $null
 
       $clangCommand = Get-Command clang-cl.exe `
@@ -214,8 +213,45 @@ build_script:
       New-Item -ItemType Directory -Force -Path $diag |
           Out-Null
 
-      # Fungsi untuk menampilkan log instalasi dependency
-      # jika konfigurasi XMake gagal.
+      # Jalankan XMake sambil menyimpan semua output ke log.
+      # ErrorActionPreference sementara diubah agar pesan stderr dari
+      # proses eksternal tidak langsung menghentikan pipeline PowerShell.
+      # Keberhasilan tetap ditentukan dari exit code XMake.
+      function Invoke-XmakeLogged {
+          param(
+              [Parameter(Mandatory = $true)]
+              [string[]]$Arguments,
+
+              [Parameter(Mandatory = $true)]
+              [string]$LogPath
+          )
+
+          $previousErrorActionPreference = $ErrorActionPreference
+          $nativeExitCode = 1
+
+          try {
+              $ErrorActionPreference = 'Continue'
+
+              & $xmakeExe @Arguments 2>&1 |
+                  Tee-Object -FilePath $LogPath |
+                  ForEach-Object {
+                      Write-Host "$_"
+                  }
+
+              $nativeExitCode = $LASTEXITCODE
+
+              if ($null -eq $nativeExitCode) {
+                  $nativeExitCode = 1
+              }
+          }
+          finally {
+              $ErrorActionPreference = $previousErrorActionPreference
+          }
+
+          return [int]$nativeExitCode
+      }
+
+      # Fungsi diagnostik untuk log instalasi dependency.
       function Show-PackageDiagnostics {
           $cacheRoot = Join-Path $env:LOCALAPPDATA '.xmake\cache\packages'
 
@@ -273,7 +309,7 @@ build_script:
                   -LiteralPath $file.FullName `
                   -Tail 250 |
                   ForEach-Object {
-                      Write-Host $_
+                      Write-Host "$_"
                   }
 
               Write-Host '========== END LOG =========='
@@ -287,14 +323,20 @@ build_script:
 
       Write-Host '========== XMAKE CONFIGURATION =========='
 
-      & $xmakeExe f -y -p windows -a x64 -m release --target_type=client 2>&1 |
-          Tee-Object -FilePath $configLog
-
-      $configExitCode = $LASTEXITCODE
+      $configExitCode = Invoke-XmakeLogged `
+          -Arguments @(
+              'f',
+              '-y',
+              '-p', 'windows',
+              '-a', 'x64',
+              '-m', 'release',
+              '--target_type=client'
+          ) `
+          -LogPath $configLog
 
       if ($configExitCode -ne 0) {
           Show-PackageDiagnostics
-          throw "XMake configuration failed ($configExitCode)."
+          throw "XMake configuration failed (exit code $configExitCode). Periksa diagnostics/xmake-config.log."
       }
 
       # Build unit tests.
@@ -302,13 +344,12 @@ build_script:
 
       Write-Host '========== BUILD FEATURE TESTS =========='
 
-      & $xmakeExe build FeatureLogicTests 2>&1 |
-          Tee-Object -FilePath $testBuildLog
-
-      $testBuildExitCode = $LASTEXITCODE
+      $testBuildExitCode = Invoke-XmakeLogged `
+          -Arguments @('build', 'FeatureLogicTests') `
+          -LogPath $testBuildLog
 
       if ($testBuildExitCode -ne 0) {
-          throw 'FeatureLogicTests build failed. Periksa diagnostics/feature-tests-build.log.'
+          throw "FeatureLogicTests build failed (exit code $testBuildExitCode). Periksa diagnostics/feature-tests-build.log."
       }
 
       # Jalankan unit tests.
@@ -316,13 +357,12 @@ build_script:
 
       Write-Host '========== RUN FEATURE TESTS =========='
 
-      & $xmakeExe run FeatureLogicTests 2>&1 |
-          Tee-Object -FilePath $testRunLog
-
-      $testRunExitCode = $LASTEXITCODE
+      $testRunExitCode = Invoke-XmakeLogged `
+          -Arguments @('run', 'FeatureLogicTests') `
+          -LogPath $testRunLog
 
       if ($testRunExitCode -ne 0) {
-          throw 'FeatureLogicTests failed. Periksa diagnostics/feature-tests-run.log.'
+          throw "FeatureLogicTests failed (exit code $testRunExitCode). Periksa diagnostics/feature-tests-run.log."
       }
 
       # Build DLL mod LeviLamina.
@@ -330,13 +370,17 @@ build_script:
 
       Write-Host '========== BUILD DETAIL ARMOR BAR MOD =========='
 
-      & $xmakeExe build DetailArmorBarBedrock 2>&1 |
-          Tee-Object -FilePath $modBuildLog
-
-      $modBuildExitCode = $LASTEXITCODE
+      $modBuildExitCode = Invoke-XmakeLogged `
+          -Arguments @('build', 'DetailArmorBarBedrock') `
+          -LogPath $modBuildLog
 
       if ($modBuildExitCode -ne 0) {
-          throw 'LeviLamina client build failed. Periksa diagnostics/mod-build.log.'
+          Write-Host ''
+          Write-Host '========== MOD BUILD FAILED =========='
+          Write-Host "XMake exit code: $modBuildExitCode"
+          Write-Host "Log: $modBuildLog"
+
+          throw "LeviLamina client build failed (exit code $modBuildExitCode). Periksa diagnostics/mod-build.log."
       }
 
       # Cari DLL hasil build.
