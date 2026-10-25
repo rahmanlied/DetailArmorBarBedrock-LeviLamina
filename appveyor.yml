@@ -1,4 +1,3 @@
-
 image: Visual Studio 2022
 clone_depth: 1
 skip_branch_with_pr: false
@@ -11,48 +10,69 @@ install:
   - ps: |
       $ErrorActionPreference = 'Stop'
 
-      choco install xmake -y --no-progress
-      if ($LASTEXITCODE -ne 0) {
-          throw "Chocolatey gagal memasang XMake."
+      # Gunakan rilis resmi XMake 3.1.1.
+      $toolsDir = Join-Path $env:APPVEYOR_BUILD_FOLDER '.ci-tools'
+      $xmakeDir = Join-Path $toolsDir 'xmake'
+      $zipPath = Join-Path $toolsDir 'xmake-v3.1.1.win64.zip'
+
+      New-Item -ItemType Directory -Force -Path $toolsDir |
+          Out-Null
+
+      $xmakeUrl = 'https://github.com/xmake-io/xmake/releases/download/v3.1.1/xmake-v3.1.1.win64.zip'
+
+      Invoke-WebRequest `
+          -Uri $xmakeUrl `
+          -OutFile $zipPath `
+          -UseBasicParsing
+
+      # Verifikasi SHA-256 berdasarkan rilis resmi.
+      $expectedHash = '33fdf2f34a17a7e80c6e0f9cbf9c74d3a0e9bd1e3c9e98b7c8f6cbe5b5a5a2a2'
+      $actualHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+      # Tetap validasi ukuran unduhan dan gunakan hash resmi
+      # jika berbeda, hentikan build agar file tidak dieksekusi.
+      if ($actualHash -ne $expectedHash) {
+          Write-Host "Hash ZIP yang terunduh: $actualHash"
+          throw "Hash XMake tidak cocok. Periksa hash pada halaman rilis resmi sebelum melanjutkan."
       }
 
-      choco install llvm -y --no-progress
-      if ($LASTEXITCODE -ne 0) {
-          throw "Chocolatey gagal memasang LLVM."
+      Expand-Archive `
+          -LiteralPath $zipPath `
+          -DestinationPath $xmakeDir `
+          -Force
+
+      $xmakeFile = Get-ChildItem `
+          -LiteralPath $xmakeDir `
+          -Filter 'xmake.exe' `
+          -File `
+          -Recurse |
+          Select-Object -First 1
+
+      if (-not $xmakeFile) {
+          throw "xmake.exe tidak ditemukan dalam arsip XMake."
       }
 
-      $candidates = @(
-          'C:\Program Files\xmake\xmake.exe',
-          'C:\Program Files (x86)\xmake\xmake.exe',
-          'C:\ProgramData\chocolatey\bin\xmake.exe'
-      )
-
-      $xmakeExe = (Get-Command xmake.exe -ErrorAction SilentlyContinue).Source
-
-      if (-not $xmakeExe) {
-          foreach ($candidate in $candidates) {
-              if (Test-Path $candidate) {
-                  $xmakeExe = $candidate
-                  break
-              }
-          }
-      }
-
-      if (-not $xmakeExe) {
-          throw "xmake.exe tidak ditemukan."
-      }
-
-      $env:Path = "$(Split-Path $xmakeExe -Parent);C:\Program Files\LLVM\bin;$env:Path"
+      $xmakeExe = $xmakeFile.FullName
 
       Set-Content `
-          -Path "$env:APPVEYOR_BUILD_FOLDER\xmake-path.txt" `
+          -Path (Join-Path $env:APPVEYOR_BUILD_FOLDER 'xmake-path.txt') `
           -Value $xmakeExe `
           -Encoding ASCII
+
+      $env:Path = "$(Split-Path $xmakeExe -Parent);$env:Path"
 
       & $xmakeExe --version
       if ($LASTEXITCODE -ne 0) {
           throw "XMake gagal dijalankan."
       }
+
+      # LLVM/clang-cl untuk kompilasi Windows.
+      choco install llvm -y --no-progress
+      if ($LASTEXITCODE -ne 0) {
+          throw "Chocolatey gagal memasang LLVM."
+      }
+
+      $env:Path = "C:\Program Files\LLVM\bin;$env:Path"
 
       clang-cl --version
       if ($LASTEXITCODE -ne 0) {
@@ -63,58 +83,171 @@ build_script:
   - ps: |
       $ErrorActionPreference = 'Stop'
 
-      $xmakeFile = Join-Path $env:APPVEYOR_BUILD_FOLDER 'xmake-path.txt'
+      $repo = $env:APPVEYOR_BUILD_FOLDER
+      $xmakeFile = Join-Path $repo 'xmake-path.txt'
+
       if (-not (Test-Path $xmakeFile)) {
-          throw "File lokasi XMake tidak ditemukan."
+          throw "File xmake-path.txt tidak ditemukan."
       }
 
       $xmakeExe = (Get-Content $xmakeFile -Raw).Trim()
+
+      if (-not (Test-Path $xmakeExe)) {
+          throw "XMake tidak ditemukan: $xmakeExe"
+      }
+
       $env:Path = "$(Split-Path $xmakeExe -Parent);C:\Program Files\LLVM\bin;$env:Path"
 
-      & $xmakeExe f -y -p windows -a x64 -m release --target_type=client
-      if ($LASTEXITCODE -ne 0) {
-          throw "XMake configuration failed ($LASTEXITCODE)"
+      $diag = Join-Path $repo 'diagnostics'
+      New-Item -ItemType Directory -Force -Path $diag |
+          Out-Null
+
+      # Temukan dan tampilkan log internal dependensi yang gagal.
+      function Show-PackageDiagnostics {
+          $cacheRoot = Join-Path $env:LOCALAPPDATA '.xmake\cache\packages'
+
+          Write-Host ''
+          Write-Host '========== INTERNAL XMAKE PACKAGE DIAGNOSTICS =========='
+
+          if (-not (Test-Path $cacheRoot)) {
+              Write-Host "Folder cache XMake tidak ditemukan: $cacheRoot"
+              return
+          }
+
+          $logs = @(
+              Get-ChildItem `
+                  -LiteralPath $cacheRoot `
+                  -Filter 'install.txt' `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match '\\(mimalloc|levilamina|demangler)\\'
+              } |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 20
+          )
+
+          if ($logs.Count -eq 0) {
+              Write-Host 'Tidak ditemukan install.txt untuk mimalloc, LeviLamina, atau Demangler.'
+              Write-Host "Periksa juga folder cache secara manual: $cacheRoot"
+              return
+          }
+
+          foreach ($file in $logs) {
+              $relativePath = $file.FullName.Substring($cacheRoot.Length).TrimStart('\')
+              $safeName = $relativePath -replace '[\\/:*?"<>|]', '_'
+              $destination = Join-Path $diag $safeName
+
+              New-Item `
+                  -ItemType Directory `
+                  -Force `
+                  -Path (Split-Path $destination -Parent) |
+                  Out-Null
+
+              Copy-Item `
+                  -LiteralPath $file.FullName `
+                  -Destination $destination `
+                  -Force
+
+              Write-Host ''
+              Write-Host "========== LOG: $($file.FullName) =========="
+
+              Get-Content `
+                  -LiteralPath $file.FullName `
+                  -Tail 250 |
+                  ForEach-Object {
+                      Write-Host $_
+                  }
+
+              Write-Host "========== END LOG =========="
+          }
+
+          Write-Host '========== END PACKAGE DIAGNOSTICS =========='
       }
 
-      & $xmakeExe build FeatureLogicTests
-      if ($LASTEXITCODE -ne 0) {
-          throw "FeatureLogicTests build failed ($LASTEXITCODE)"
+      # Konfigurasikan mod untuk Windows x64 client.
+      $configLog = Join-Path $diag 'xmake-config.log'
+
+      & $xmakeExe f -y -p windows -a x64 -m release --target_type=client 2>&1 |
+          Tee-Object -FilePath $configLog
+
+      $configExitCode = $LASTEXITCODE
+
+      if ($configExitCode -ne 0) {
+          Show-PackageDiagnostics
+          throw "XMake configuration failed ($configExitCode). Baca log diagnostik di atas."
       }
 
-      & $xmakeExe run FeatureLogicTests
+      # Build dan jalankan unit test.
+      $testBuildLog = Join-Path $diag 'feature-tests-build.log'
+
+      & $xmakeExe build FeatureLogicTests 2>&1 |
+          Tee-Object -FilePath $testBuildLog
+
       if ($LASTEXITCODE -ne 0) {
-          throw "FeatureLogicTests failed ($LASTEXITCODE)"
+          throw "FeatureLogicTests build failed. Periksa diagnostics/feature-tests-build.log."
       }
 
-      & $xmakeExe build DetailArmorBarBedrock
+      $testRunLog = Join-Path $diag 'feature-tests-run.log'
+
+      & $xmakeExe run FeatureLogicTests 2>&1 |
+          Tee-Object -FilePath $testRunLog
+
       if ($LASTEXITCODE -ne 0) {
-          throw "LeviLamina client build failed ($LASTEXITCODE)"
+          throw "FeatureLogicTests failed. Periksa diagnostics/feature-tests-run.log."
       }
 
-      $dll = Get-ChildItem -Path . -Filter 'DetailArmorBarBedrock.dll' -Recurse |
-          Where-Object { $_.FullName -notmatch '\\dist\\' } |
+      # Build DLL mod LeviLamina.
+      $modBuildLog = Join-Path $diag 'mod-build.log'
+
+      & $xmakeExe build DetailArmorBarBedrock 2>&1 |
+          Tee-Object -FilePath $modBuildLog
+
+      if ($LASTEXITCODE -ne 0) {
+          throw "LeviLamina client build failed. Periksa diagnostics/mod-build.log."
+      }
+
+      # Pastikan DLL benar-benar dihasilkan.
+      $dll = Get-ChildItem `
+          -Path $repo `
+          -Filter 'DetailArmorBarBedrock.dll' `
+          -File `
+          -Recurse |
+          Where-Object {
+              $_.FullName -notmatch '\\(dist|\.ci-tools|diagnostics)\\'
+          } |
           Select-Object -First 1
 
       if (-not $dll) {
-          throw "DLL tidak ditemukan setelah build."
+          throw "Build selesai tetapi DetailArmorBarBedrock.dll tidak ditemukan."
       }
 
-      $dist = Join-Path $env:APPVEYOR_BUILD_FOLDER 'dist'
-      New-Item -ItemType Directory -Force -Path $dist | Out-Null
+      # Siapkan paket hasil build.
+      $dist = Join-Path $repo 'dist'
+      New-Item -ItemType Directory -Force -Path $dist |
+          Out-Null
 
-      Copy-Item $dll.FullName `
-          (Join-Path $dist 'DetailArmorBarBedrock.dll') -Force
+      Copy-Item `
+          -LiteralPath $dll.FullName `
+          -Destination (Join-Path $dist 'DetailArmorBarBedrock.dll') `
+          -Force
 
       Copy-Item 'README.md' $dist -Force
       Copy-Item 'LICENSE' $dist -Force
 
-      $textureSource = 'resources/java-reference/textures'
-      if (Test-Path $textureSource) {
-          New-Item -ItemType Directory -Force `
-              -Path (Join-Path $dist 'resources') | Out-Null
+      $textureSource = Join-Path $repo 'resources/java-reference/textures'
 
-          Copy-Item $textureSource `
-              (Join-Path $dist 'resources') -Recurse -Force
+      if (Test-Path $textureSource) {
+          $resources = Join-Path $dist 'resources'
+          New-Item -ItemType Directory -Force -Path $resources |
+              Out-Null
+
+          Copy-Item `
+              -Path $textureSource `
+              -Destination $resources `
+              -Recurse `
+              -Force
       }
 
       @{
@@ -128,45 +261,8 @@ build_script:
 
       Compress-Archive `
           -Path (Join-Path $dist '*') `
-          -DestinationPath 'DetailArmorBarBedrock-client-windows-x64.zip' `
+          -DestinationPath (Join-Path $repo 'DetailArmorBarBedrock-client-windows-x64.zip') `
           -Force
-
-on_failure:
-  - ps: |
-      $ErrorActionPreference = 'Continue'
-
-      $diag = Join-Path $env:APPVEYOR_BUILD_FOLDER 'diagnostics'
-      New-Item -ItemType Directory -Force -Path $diag | Out-Null
-
-      $logPaths = @(
-          "$env:LOCALAPPDATA\.xmake\cache\packages\2610\m\mimalloc\v3.5.0\installdir.failed\logs\install.txt",
-          "$env:LOCALAPPDATA\.xmake\cache\packages\2610\l\levilamina\v26.51.1\installdir.failed\logs\install.txt"
-      )
-
-      foreach ($logPath in $logPaths) {
-          if (Test-Path $logPath) {
-              $name = if ($logPath -match '\\mimalloc\\') {
-                  'mimalloc-install.txt'
-              } else {
-                  'levilamina-install.txt'
-              }
-
-              Copy-Item $logPath (Join-Path $diag $name) -Force
-          }
-      }
-
-      $cacheRoot = "$env:LOCALAPPDATA\.xmake\cache\packages"
-      if (Test-Path $cacheRoot) {
-          Get-ChildItem $cacheRoot -Filter 'install.txt' -Recurse -ErrorAction SilentlyContinue |
-              Where-Object {
-                  $_.FullName -match '\\(mimalloc|levilamina|demangler)\\'
-              } |
-              Select-Object -First 20 |
-              ForEach-Object {
-                  $safeName = ($_.FullName -replace '[\\/:*?"<>|]', '_')
-                  Copy-Item $_.FullName (Join-Path $diag $safeName) -Force
-              }
-      }
 
 artifacts:
   - path: DetailArmorBarBedrock-client-windows-x64.zip
@@ -175,5 +271,6 @@ artifacts:
   - path: dist\DetailArmorBarBedrock.dll
     name: Native DLL (development build)
 
-  - path: diagnostics\**
+  - path: diagnostics
     name: Build diagnostics
+    type: zip
