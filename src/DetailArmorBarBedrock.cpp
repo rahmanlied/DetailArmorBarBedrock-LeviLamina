@@ -3,6 +3,7 @@
 #include "ll/api/mod/RegisterHelper.h"
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/input/KeyInputEvent.h"
+#include "mc/client/input/HIDController.h"
 
 #include "mc/client/game/ClientInstance.h"
 #include "mc/client/player/LocalPlayer.h"
