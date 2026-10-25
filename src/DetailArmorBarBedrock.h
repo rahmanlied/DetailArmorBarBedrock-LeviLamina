@@ -1,23 +1,41 @@
 #pragma once
 
 #include "config/ArmorBarConfig.h"
-#include "ll/api/mod/Mod.h"
+
 #include <filesystem>
+#include <ll/api/mod/NativeMod.h>
 
 namespace dab::bedrock {
 
-class DetailArmorBarBedrock final : public ll::mod::Mod {
+class DetailArmorBarBedrock final {
 public:
-    void load() override;
-    bool enable() override;
-    bool disable() override;
+    DetailArmorBarBedrock();
 
     static DetailArmorBarBedrock& getInstance();
-    const config::ArmorBarConfig& getConfig() const { return mConfig; }
-    config::ArmorBarConfig& getMutableConfig() { return mConfig; }
-    const std::filesystem::path& getConfigPath() const { return mConfigPath; }
+
+    [[nodiscard]] ll::mod::NativeMod& getSelf() const {
+        return mSelf;
+    }
+
+    bool load();
+    bool enable();
+    bool disable();
+
+    [[nodiscard]] const config::ArmorBarConfig& getConfig() const {
+        return mConfig;
+    }
+
+    [[nodiscard]] config::ArmorBarConfig& getMutableConfig() {
+        return mConfig;
+    }
+
+    [[nodiscard]] const std::filesystem::path& getConfigPath() const {
+        return mConfigPath;
+    }
 
 private:
+    ll::mod::NativeMod& mSelf;
+
     config::ArmorBarConfig mConfig{};
     std::filesystem::path mConfigPath;
 };
