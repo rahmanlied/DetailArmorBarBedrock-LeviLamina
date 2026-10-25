@@ -11,6 +11,7 @@
 #include "render/ArmorHudRenderer.h"
 
 #include <filesystem>
+#include <exception>
 
 namespace dab::bedrock {
 
@@ -39,7 +40,9 @@ bool DetailArmorBarBedrock::load() {
             getSelf().getConfigDir()
         );
 
-        mConfig = config::ArmorBarConfig::loadOrCreate(mConfigPath);
+        mConfig = config::ArmorBarConfig::loadOrCreate(
+            mConfigPath
+        );
 
         getSelf().getLogger().info(
             "DetailArmorBarBedrock config loaded: {}",
