@@ -76,7 +76,6 @@ RectangleArea makeRect(
 ) {
     RectangleArea rect;
 
-    // RectangleArea members are represented as float in this SDK.
     rect._x0 = x;
     rect._x1 = x + width;
     rect._y0 = y;
@@ -90,10 +89,8 @@ mce::Color colorFromArgb(std::uint32_t argb) {
 
     const auto r =
         static_cast<float>((argb >> 16) & 0xffu) * k;
-
     const auto g =
         static_cast<float>((argb >> 8) & 0xffu) * k;
-
     const auto b =
         static_cast<float>(argb & 0xffu) * k;
 
@@ -161,7 +158,6 @@ int armorValue(ItemStack const& stack) {
 int maxDamage(ItemStack const& stack) {
     auto const* item = itemOf(stack);
 
-    // Cast first so std::max receives matching argument types.
     return item
         ? std::max(0, static_cast<int>(item->getMaxDamage()))
         : 0;
@@ -177,10 +173,11 @@ int enchantLevel(
 }
 
 bool hasProtection(ItemStack const& stack) {
-    return enchantLevel(Enchant::Type::Protection, stack) > 0 ||
-           enchantLevel(Enchant::Type::ProjectileProtection, stack) > 0 ||
-           enchantLevel(Enchant::Type::BlastProtection, stack) > 0 ||
-           enchantLevel(Enchant::Type::FireProtection, stack) > 0;
+    return
+        enchantLevel(Enchant::Type::Protection, stack) > 0 ||
+        enchantLevel(Enchant::Type::ProjectileProtection, stack) > 0 ||
+        enchantLevel(Enchant::Type::BlastProtection, stack) > 0 ||
+        enchantLevel(Enchant::Type::FireProtection, stack) > 0;
 }
 
 feature::ProtectionKind protectionKind(ItemStack const& stack) {
@@ -261,7 +258,7 @@ std::uint32_t durabilityColor(float percent) {
         return 0xffffd447;
     }
 
-    return 0xff65d46e;
+    return 0xff65d46eu;
 }
 
 void drawTinyDigit(
@@ -325,18 +322,16 @@ void drawPercent(
 
     if (percent == 100) {
         drawTinyDigit(ctx, 1, x, y, 0xffffffffu, scale);
-        drawTinyDigit(ctx, 0, x + 4.0f * scale, y, 0xffffffffu, scale);
-        drawTinyDigit(ctx, 0, x + 8.0f * scale, y, 0xffffffffu, scale);
+        drawTinyDigit(
+            ctx, 0, x + 4.0f * scale, y, 0xffffffffu, scale
+        );
+        drawTinyDigit(
+            ctx, 0, x + 8.0f * scale, y, 0xffffffffu, scale
+        );
     } else {
         drawTinyDigit(
-            ctx,
-            percent / 10,
-            x,
-            y,
-            0xffffffffu,
-            scale
+            ctx, percent / 10, x, y, 0xffffffffu, scale
         );
-
         drawTinyDigit(
             ctx,
             percent % 10,
@@ -353,11 +348,7 @@ float protectionPulse(
     std::string const& speed,
     std::uint64_t frame
 ) {
-    if (effectType == "STATIC") {
-        return 1.0f;
-    }
-
-    if (effectType == "OUTLINE") {
+    if (effectType == "STATIC" || effectType == "OUTLINE") {
         return 1.0f;
     }
 
@@ -374,12 +365,8 @@ float protectionPulse(
         ) /
         static_cast<float>(duration * 2);
 
-    return 0.28f +
-           0.72f *
-               (
-                   0.5f +
-                   0.5f * std::sin(phase * 6.28318530718f)
-               );
+    return 0.28f + 0.72f *
+        (0.5f + 0.5f * std::sin(phase * 6.28318530718f));
 }
 
 int enabledThresholdAt(
@@ -407,16 +394,11 @@ int enabledThresholdAt(
 
 int thresholdIndex(int threshold) {
     switch (threshold) {
-        case 50:
-            return 0;
-        case 25:
-            return 1;
-        case 10:
-            return 2;
-        case 5:
-            return 3;
-        default:
-            return -1;
+        case 50: return 0;
+        case 25: return 1;
+        case 10: return 2;
+        case 5: return 3;
+        default: return -1;
     }
 }
 
@@ -485,27 +467,29 @@ void notifyDurability(
             )
         ) {
             if (c.toggleDurabilityToastNotification) {
-                if (auto* gui = client.getGuiData()) {
-                    std::string message =
-                        "Durability warning (" +
-                        std::to_string(threshold) +
-                        "%): " +
-                        std::string(
-                            kArmorSlots[
-                                static_cast<std::size_t>(slotIndex)
-                            ].label
-                        ) +
-                        " " +
-                        std::to_string(
-                            static_cast<int>(std::round(percent))
-                        ) +
-                        "% remaining";
+                // getGuiData returns NotNullNonOwnerPtr<GuiData>,
+                // not a raw pointer.
+                auto gui = client.getGuiData();
 
-                    gui->showPopupNotice(
-                        message,
-                        "Detail Armor Bar"
-                    );
-                }
+                const std::string message =
+                    "Durability warning (" +
+                    std::to_string(threshold) +
+                    "%): " +
+                    std::string(
+                        kArmorSlots[
+                            static_cast<std::size_t>(slotIndex)
+                        ].label
+                    ) +
+                    " " +
+                    std::to_string(
+                        static_cast<int>(std::round(percent))
+                    ) +
+                    "% remaining";
+
+                gui->showPopupNotice(
+                    message,
+                    "Detail Armor Bar"
+                );
             }
 
             if (c.toggleDurabilitySoundNotification) {
@@ -513,12 +497,15 @@ void notifyDurability(
                     case 50:
                         client.playUI("note.hat", 0.2f, 1.0f);
                         break;
+
                     case 25:
                         client.playUI("note.pling", 0.3f, 1.0f);
                         break;
+
                     case 10:
                         client.playUI("note.bass", 0.4f, 1.0f);
                         break;
+
                     case 5:
                         client.playUI(
                             "random.anvil_land",
@@ -526,6 +513,7 @@ void notifyDurability(
                             1.0f
                         );
                         break;
+
                     default:
                         break;
                 }
@@ -559,7 +547,6 @@ void renderDurabilityHud(
         return;
     }
 
-    // RectangleArea coordinates are direct float values in this SDK.
     const float left = screen._x0;
     const float right = screen._x1;
     const float top = screen._y0;
@@ -574,17 +561,11 @@ void renderDurabilityHud(
     float x = left + 8.0f;
     float y = top + 12.0f;
 
-    if (
-        c.durabilityHudPosition.find("RIGHT") !=
-        std::string::npos
-    ) {
+    if (c.durabilityHudPosition.find("RIGHT") != std::string::npos) {
         x = right - panelWidth - 8.0f;
     }
 
-    if (
-        c.durabilityHudPosition.find("BOTTOM") !=
-        std::string::npos
-    ) {
+    if (c.durabilityHudPosition.find("BOTTOM") != std::string::npos) {
         y = bottom - rowHeight * 4.0f - 70.0f;
     }
 
@@ -627,12 +608,7 @@ void renderDurabilityHud(
             y + static_cast<float>(i) * rowHeight;
 
         fill(
-            ctx,
-            x,
-            ry,
-            panelWidth,
-            11.0f * scale,
-            0xcc101418u
+            ctx, x, ry, panelWidth, 11.0f * scale, 0xcc101418u
         );
 
         outline(
@@ -694,7 +670,6 @@ void renderArmorBar(
     config::ArmorBarConfig const& c
 ) {
     feature::ArmorSnapshot snapshot;
-
     int armorSum = 0;
 
     std::array<ItemStack const*, 4> stacks{};
@@ -708,22 +683,16 @@ void renderArmorBar(
         feature::ArmorPiece& piece = snapshot.pieces[i];
 
         piece.equipped = !stack.isNull();
-
         piece.itemId = piece.equipped
             ? stack.getRawNameId()
             : std::string{};
 
         ids[i] = piece.itemId;
-
-        piece.armorPoints =
-            piece.equipped ? armorValue(stack) : 0;
-
+        piece.armorPoints = piece.equipped ? armorValue(stack) : 0;
         piece.damage = piece.equipped
             ? static_cast<int>(stack.getDamageValue())
             : 0;
-
-        piece.maxDamage =
-            piece.equipped ? maxDamage(stack) : 0;
+        piece.maxDamage = piece.equipped ? maxDamage(stack) : 0;
 
         piece.mending =
             piece.equipped &&
@@ -733,10 +702,8 @@ void renderArmorBar(
             piece.equipped &&
             enchantLevel(Enchant::Type::Thorns, stack) > 0;
 
-        piece.enchanted =
-            piece.equipped && stack.isEnchanted();
+        piece.enchanted = piece.equipped && stack.isEnchanted();
 
-        // Elytra is the built-in special-item bar.
         piece.hasCustomItemBar =
             piece.equipped &&
             c.toggleItemBar &&
@@ -785,13 +752,9 @@ void renderArmorBar(
         std::max(0, player.getArmorValue());
 
     snapshot.baseArmor =
-        std::max(
-            0,
-            snapshot.reportedArmorValue - armorSum
-        );
+        std::max(0, snapshot.reportedArmorValue - armorSum);
 
     auto points = feature::buildBarPointLayout(snapshot, c);
-
     const int totalPoints = static_cast<int>(points.size());
 
     if (totalPoints == 0 && c.toggleHideBarWithoutArmor) {
@@ -815,7 +778,6 @@ void renderArmorBar(
         )
         : 1;
 
-    // RectangleArea coordinates are direct float values.
     const float screenLeft = screen._x0;
     const float screenRight = screen._x1;
     const float screenBottom = screen._y1;
@@ -899,7 +861,6 @@ void renderArmorBar(
         const int inRow = pointIndex % kArmorPointsPerRow;
 
         int iconColumn = inRow / 2;
-
         const bool secondHalf = (inRow % 2) != 0;
 
         if (c.toggleInverseSlot) {
@@ -915,28 +876,10 @@ void renderArmorBar(
         const float halfX =
             x + (secondHalf != c.toggleInverseSlot ? 5.0f : 1.0f);
 
-        const float halfW =
-            static_cast<float>(kHalfPointWidth);
+        const float halfW = static_cast<float>(kHalfPointWidth);
 
-        fill(
-            ctx,
-            x + 1.0f,
-            y + 1.0f,
-            7.0f,
-            7.0f,
-            0xff20252au
-        );
-
-        outline(
-            ctx,
-            x,
-            y,
-            9.0f,
-            9.0f,
-            0xff7a838bu,
-            0.9f,
-            1
-        );
+        fill(ctx, x + 1.0f, y + 1.0f, 7.0f, 7.0f, 0xff20252au);
+        outline(ctx, x, y, 9.0f, 9.0f, 0xff7a838bu, 0.9f, 1);
 
         if (pointIndex >= static_cast<int>(points.size())) {
             continue;
@@ -950,7 +893,6 @@ void renderArmorBar(
         }
 
         std::uint32_t baseColor = 0xffaeb6bfu;
-
         ItemStack const* pieceStack = nullptr;
 
         if (point.pieceIndex >= 0 && point.pieceIndex < 4) {
@@ -969,14 +911,7 @@ void renderArmorBar(
             }
         }
 
-        fill(
-            ctx,
-            halfX,
-            y + 1.0f,
-            halfW,
-            7.0f,
-            baseColor
-        );
+        fill(ctx, halfX, y + 1.0f, halfW, 7.0f, baseColor);
 
         if (
             c.toggleEnchants &&
@@ -1176,7 +1111,6 @@ void renderArmorBar(
                     lastNotice != 0
                 ) {
                     const auto elapsed = gFrame - lastNotice;
-
                     float warningAlpha = 0.0f;
 
                     if (c.toggleRepeatedDurabilityNotifications) {
@@ -1238,7 +1172,6 @@ void renderArmorBar(
 
             const float x =
                 baseX + static_cast<float>(iconColumn * kIconWidth);
-
             const float y =
                 baseY + static_cast<float>(row * 10);
 
@@ -1254,26 +1187,9 @@ void renderArmorBar(
                 protectionPulse(c.effectType, c.effectSpeed, gFrame);
 
             if (c.effectType == "OUTLINE") {
-                outline(
-                    ctx,
-                    halfX,
-                    y + 1.0f,
-                    w,
-                    7.0f,
-                    color,
-                    pulse,
-                    1
-                );
+                outline(ctx, halfX, y + 1.0f, w, 7.0f, color, pulse, 1);
             } else {
-                fill(
-                    ctx,
-                    halfX,
-                    y + 1.0f,
-                    w,
-                    7.0f,
-                    color,
-                    pulse
-                );
+                fill(ctx, halfX, y + 1.0f, w, 7.0f, color, pulse);
             }
         }
     }
@@ -1318,7 +1234,10 @@ bool installArmorHudRenderer(config::ArmorBarConfig& config) {
                     ++gFrame;
 
                     auto& context = event.uiRenderContext();
-                    auto& client = context.mClient.get();
+
+                    // context.mClient is already IClientInstance.
+                    // Do not call .get() on it.
+                    auto& client = context.mClient;
 
                     auto* player = client.getLocalPlayer();
 
