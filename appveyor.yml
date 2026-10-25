@@ -26,7 +26,7 @@ install:
           -UseBasicParsing
 
       # Verifikasi SHA-256 berdasarkan rilis resmi.
-      $expectedHash = '33fdf2f34a17a7e80c6e0f9cbf9c74d3a0e9bd1e3c9e98b7c8f6cbe5b5a5a2a2'
+      $expectedHash = '33fdf2f34a0e45fa731c000d59590d27b13dec7011f69cbf575004ed9279b4a2'
       $actualHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
       # Tetap validasi ukuran unduhan dan gunakan hash resmi
