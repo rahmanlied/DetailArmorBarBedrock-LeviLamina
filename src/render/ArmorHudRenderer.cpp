@@ -5,6 +5,8 @@
 #include "ll/api/event/render/UIRenderEvent.h"
 
 #include "mc/client/game/ClientInstance.h"
+#include "mc/client/gui/GuiData.h"
+#include "mc/client/player/LocalPlayer.h"
 #include "mc/client/renderer/screen/MinecraftUIRenderContext.h"
 #include "mc/deps/core/math/Color.h"
 #include "mc/deps/input/RectangleArea.h"
@@ -75,7 +77,6 @@ RectangleArea makeRect(
     float height
 ) {
     RectangleArea rect;
-
     rect._x0 = x;
     rect._x1 = x + width;
     rect._y0 = y;
@@ -467,8 +468,6 @@ void notifyDurability(
             )
         ) {
             if (c.toggleDurabilityToastNotification) {
-                // getGuiData returns NotNullNonOwnerPtr<GuiData>,
-                // not a raw pointer.
                 auto gui = client.getGuiData();
 
                 const std::string message =
@@ -497,15 +496,12 @@ void notifyDurability(
                     case 50:
                         client.playUI("note.hat", 0.2f, 1.0f);
                         break;
-
                     case 25:
                         client.playUI("note.pling", 0.3f, 1.0f);
                         break;
-
                     case 10:
                         client.playUI("note.bass", 0.4f, 1.0f);
                         break;
-
                     case 5:
                         client.playUI(
                             "random.anvil_land",
@@ -513,7 +509,6 @@ void notifyDurability(
                             1.0f
                         );
                         break;
-
                     default:
                         break;
                 }
@@ -554,7 +549,6 @@ void renderDurabilityHud(
 
     const float scale =
         std::clamp(c.durabilityHudScale, 0.5f, 3.0f);
-
     const float panelWidth = 88.0f * scale;
     const float rowHeight = 15.0f * scale;
 
@@ -608,7 +602,12 @@ void renderDurabilityHud(
             y + static_cast<float>(i) * rowHeight;
 
         fill(
-            ctx, x, ry, panelWidth, 11.0f * scale, 0xcc101418u
+            ctx,
+            x,
+            ry,
+            panelWidth,
+            11.0f * scale,
+            0xcc101418u
         );
 
         outline(
@@ -689,9 +688,11 @@ void renderArmorBar(
 
         ids[i] = piece.itemId;
         piece.armorPoints = piece.equipped ? armorValue(stack) : 0;
+
         piece.damage = piece.equipped
             ? static_cast<int>(stack.getDamageValue())
             : 0;
+
         piece.maxDamage = piece.equipped ? maxDamage(stack) : 0;
 
         piece.mending =
@@ -710,7 +711,6 @@ void renderArmorBar(
             piece.itemId.find("elytra") != std::string::npos;
 
         piece.customItemBarPoints = 2;
-
         armorSum += piece.armorPoints;
 
         if (piece.equipped && piece.maxDamage > 0) {
@@ -1177,7 +1177,6 @@ void renderArmorBar(
 
             const float halfX =
                 x + (secondHalf != c.toggleInverseSlot ? 5.0f : 1.0f);
-
             const float w = static_cast<float>(kHalfPointWidth);
 
             const auto color =
@@ -1234,11 +1233,7 @@ bool installArmorHudRenderer(config::ArmorBarConfig& config) {
                     ++gFrame;
 
                     auto& context = event.uiRenderContext();
-
-                    // context.mClient is already IClientInstance.
-                    // Do not call .get() on it.
                     auto& client = context.mClient;
-
                     auto* player = client.getLocalPlayer();
 
                     if (player == nullptr) {
