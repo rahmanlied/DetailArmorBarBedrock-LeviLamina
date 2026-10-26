@@ -1,7 +1,7 @@
 set_project("DetailArmorBarBedrock")
 set_version("0.2.0-dev")
 set_license("MIT")
-set_languages("cxx20")
+set_languages("cxx23")
 set_warnings("allextra")
 set_runtimes("MD")
 
@@ -29,7 +29,7 @@ end
 -- from manifest.json and the linked DLL.
 target("DetailArmorBarBedrock")
     set_kind("shared")
-    set_languages("cxx20")
+    set_languages("cxx23")
     add_rules("@levibuildscript/linkrule")
     add_rules("@levibuildscript/modpacker")
     add_files("src/DetailArmorBarBedrock.cpp", "src/config/ArmorBarConfig.cpp", "src/feature/FeatureLogic.cpp", "src/ui/SettingsMenu.cpp", "src/render/ArmorHudRenderer.cpp")
@@ -41,7 +41,7 @@ target_end()
 -- Pure logic tests: no Bedrock runtime required.
 target("FeatureLogicTests")
     set_kind("binary")
-    set_languages("cxx20")
+    set_languages("cxx23")
     add_files("tests/feature_logic_tests.cpp", "src/feature/FeatureLogic.cpp")
     add_includedirs("src")
 target_end()
