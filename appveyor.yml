@@ -449,7 +449,7 @@ build_script:
           entry = 'DetailArmorBarBedrock.dll'
           version = '0.2.0-dev'
           type = 'native'
-          platform = 'windows'
+          platform = 'client'
       } |
           ConvertTo-Json |
           Set-Content `

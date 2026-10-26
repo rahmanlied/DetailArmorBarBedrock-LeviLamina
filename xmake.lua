@@ -15,7 +15,7 @@ option("target_type")
     set_description("This project is a client-only LeviLamina mod")
 option_end()
 
-add_requires("levilamina v26.51.1", {configs = {target_type = get_config("target_type")}})
+add_requires("levilamina v26.51.7", {configs = {target_type = get_config("target_type")}})
 add_requires("levibuildscript")
 add_requires("nlohmann_json")
 
