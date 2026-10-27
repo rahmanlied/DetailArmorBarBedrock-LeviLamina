@@ -1,11 +1,12 @@
+
 image: Visual Studio 2022
 clone_depth: 1
 skip_branch_with_pr: false
 
 cache:
   - .ci-tools
-  - '%LOCALAPPDATA%\.xmake\packages -> xmake.lua'
-  - '%LOCALAPPDATA%\.xmake\cache -> xmake.lua'
+  - '%LOCALAPPDATA%\.xmake\packages'
+  - '%LOCALAPPDATA%\.xmake\cache'
 
 environment:
   TARGET_VERSION: "26.51.1"
