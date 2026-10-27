@@ -2,13 +2,12 @@
 
 #include "ll/api/mod/RegisterHelper.h"
 #include "ll/api/event/EventBus.h"
-#include "ll/api/event/input/KeyInputEvent.h"
-#include "ll/api/service/Bedrock.h"
-
-#include "mc/world/level/Level.h"
-
+#include "ll/api/event/render/UIRenderEvent.h"
 #include "ui/SettingsMenu.h"
 #include "render/ArmorHudRenderer.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 
 #include <filesystem>
 #include <exception>
@@ -19,7 +18,7 @@ namespace {
 
 ll::event::ListenerPtr gSettingsKeyListener;
 
-constexpr int kSettingsKeyF8 = 0x77;
+bool gF8WasDown = false;
 
 } // namespace
 
@@ -67,8 +66,11 @@ bool DetailArmorBarBedrock::load() {
 }
 
 bool DetailArmorBarBedrock::enable() {
+    const auto armorAtlasArchive =
+        getSelf().getConfigDir().parent_path() /
+        "resources" / "DetailArmorBarBedrockTextures.zip";
     const bool hudInstalled =
-        render::installArmorHudRenderer(mConfig);
+        render::installArmorHudRenderer(mConfig, armorAtlasArchive);
 
     if (!hudInstalled) {
         getSelf().getLogger().error(
@@ -78,46 +80,48 @@ bool DetailArmorBarBedrock::enable() {
         return false;
     }
 
+    // Poll the real Win32 virtual key from the game's UI render event. In GDK
+    // client mode KeyInputEvent is not consistently delivered for F8 on every
+    // launcher/build combination; edge detection prevents opening the form every
+    // render frame while F8 is held down.
+    gF8WasDown = false;
     gSettingsKeyListener =
         ll::event::EventBus::getInstance()
-            .emplaceListener<ll::event::KeyInputEvent>(
-                [this](ll::event::KeyInputEvent& event) {
-                    static bool f8Held = false;
-
-                    if (event.keyCode() != kSettingsKeyF8) {
+            .emplaceListener<ll::event::AfterUIRenderEvent>(
+                [this](ll::event::AfterUIRenderEvent& event) {
+                    const bool isDown = (::GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+                    if (!isDown) {
+                        gF8WasDown = false;
                         return;
                     }
-
-                    if (!event.isDown()) {
-                        f8Held = false;
+                    if (gF8WasDown) {
                         return;
                     }
+                    gF8WasDown = true;
 
-                    if (f8Held) {
-                        return;
-                    }
-
-                    f8Held = true;
-
-                    // Do not call event.controller():
-                    // HIDController is an incomplete type here.
-                    auto level = ll::service::bedrock::getLevel();
-
-                    if (!level) {
-                        return;
-                    }
-
-                    auto* player = level->getPrimaryLocalPlayer();
-
+                    auto& context = event.uiRenderContext();
+                    auto* player = context.mClient.getLocalPlayer();
                     if (player == nullptr) {
+                        getSelf().getLogger().warn(
+                            "F8 was pressed but the local player is not available."
+                        );
                         return;
                     }
 
-                    ui::openSettingsMenu(
-                        *player,
-                        mConfig,
-                        mConfigPath
+                    getSelf().getLogger().info(
+                        "F8 detected by Win32 polling; opening settings form."
                     );
+                    try {
+                        ui::openSettingsMenu(*player, mConfig, mConfigPath);
+                    } catch (const std::exception& error) {
+                        getSelf().getLogger().error(
+                            "Failed to open F8 settings menu: {}", error.what()
+                        );
+                    } catch (...) {
+                        getSelf().getLogger().error(
+                            "Failed to open F8 settings menu: unknown exception."
+                        );
+                    }
                 }
             );
 
@@ -148,6 +152,7 @@ bool DetailArmorBarBedrock::disable() {
 
         gSettingsKeyListener.reset();
     }
+    gF8WasDown = false;
 
     getSelf().getLogger().info(
         "DetailArmorBarBedrock disabled."

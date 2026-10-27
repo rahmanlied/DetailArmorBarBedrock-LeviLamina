@@ -1,14 +1,19 @@
 #include "ArmorHudRenderer.h"
 #include "../feature/FeatureLogic.h"
 
-#include "ll/api/event/EventBus.h"
-#include "ll/api/event/render/UIRenderEvent.h"
+#include "ll/api/memory/Hook.h"
 
 #include "mc/client/game/ClientInstance.h"
 #include "mc/client/gui/GuiData.h"
+#include "mc/client/gui/controls/renderers/HudArmorRenderer.h"
 #include "mc/client/player/LocalPlayer.h"
 #include "mc/client/renderer/screen/MinecraftUIRenderContext.h"
 #include "mc/deps/core/math/Color.h"
+#include "mc/deps/core/file/Path.h"
+#include "mc/deps/core/file/PathView.h"
+#include "mc/deps/core/resource/ResourceLocation.h"
+#include "mc/deps/minecraft_renderer/renderer/TexturePtr.h"
+#include "mc/deps/minecraft_renderer/renderer/BedrockTextureData.h"
 #include "mc/deps/input/RectangleArea.h"
 #include "mc/deps/shared_types/legacy/actor/ArmorSlot.h"
 #include "mc/world/actor/player/Player.h"
@@ -22,22 +27,32 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace dab::render {
+
 namespace {
 
-constexpr int kHalfPointWidth = 4;
-constexpr int kIconWidth = 9;
+constexpr float kHalfPointWidth = 3.0f;
+constexpr int kIconWidth = 8;
 constexpr int kIconHeight = 9;
 constexpr int kArmorPointsPerRow = 20;
 constexpr int kIconsPerRow = 10;
-constexpr int kBaseYFromBottom = 80;
+// The vanilla armor row is left-aligned above the hearts in Bedrock HUD.
+// These defaults target that row instead of drawing a second bar at screen center.
+constexpr float kBaseXOffsetFromCenter = 91.0f;
+constexpr int kBaseYFromBottom = 49;
 
-ll::event::ListenerPtr gHudListener;
 config::ArmorBarConfig* gConfig = nullptr;
+std::filesystem::path gArmorAtlasArchive;
+std::shared_ptr<BedrockTextureData const> gArmorAtlasData;
+bool gArmorAtlasLoadAttempted = false;
+bool gVanillaHudHookInstalled = false;
 std::uint64_t gFrame = 0;
 
 struct SlotHistory {
@@ -62,6 +77,41 @@ struct SlotInfo {
     SharedTypes::Legacy::ArmorSlot slot;
     const char* label;
 };
+
+// Read native ItemStack/enchantment data once per armor slot, then reuse it
+// for every half-point drawn that frame. EnchantUtils calls are relatively
+// expensive compared with the simple rectangles used for drawing.
+struct PieceRenderState {
+    bool equipped = false;
+    std::string itemId;
+    int armorPoints = 0;
+    int damage = 0;
+    int maxDamage = 0;
+    int protection = 0;
+    int projectileProtection = 0;
+    int blastProtection = 0;
+    int fireProtection = 0;
+    bool mending = false;
+    bool thorns = false;
+    bool enchanted = false;
+    bool hasProtection = false;
+    feature::ProtectionKind protectionKind = feature::ProtectionKind::Generic;
+    float durabilityWarningAlpha = 0.0f;
+    std::uint32_t durabilityWarningColor = 0;
+};
+
+// Armor properties/enchantments are expensive native queries. Refresh them at
+// a short interval and reuse the last snapshot on intermediate UI frames.
+constexpr std::uint64_t kArmorStateRefreshIntervalFrames = 8;
+std::array<PieceRenderState, 4> gPieceStates{};
+feature::ArmorSnapshot gArmorSnapshot{};
+Player* gCachedStatePlayer = nullptr;
+std::uint64_t gLastStateRefreshFrame = 0;
+bool gSnapshotValid = false;
+std::vector<feature::BarPoint> gCachedPoints;
+bool gLayoutCacheValid = false;
+bool gLastToggleItemBar = false;
+bool gLastToggleSortSpecialItem = false;
 
 constexpr std::array<SlotInfo, 4> kArmorSlots{{
     {SharedTypes::Legacy::ArmorSlot::Head, "Helmet"},
@@ -144,6 +194,206 @@ void outline(
     );
 }
 
+// Load the Java port's 128x128 atlas from the ZIP packaged with the mod. The
+// texture is held as BedrockTextureData so the UI renderer can reuse the same
+// GPU texture on every subsequent frame (no per-frame texture lookup).
+bool ensureArmorAtlas(MinecraftUIRenderContext& ctx) {
+    if (gArmorAtlasLoadAttempted) {
+        return static_cast<bool>(gArmorAtlasData);
+    }
+    gArmorAtlasLoadAttempted = true;
+
+    if (gArmorAtlasArchive.empty() ||
+        !std::filesystem::exists(gArmorAtlasArchive)) {
+        return false;
+    }
+
+    const Core::Path zipPath(gArmorAtlasArchive);
+    const ResourceLocation atlasLocation{Core::PathView{"textures/armor_bar"}};
+    auto texture = ctx.getZippedTexture(zipPath, atlasLocation, false);
+    std::shared_ptr<BedrockTextureData const> textureData = texture.mClientTexture;
+    if (!textureData) {
+        return false;
+    }
+
+    gArmorAtlasData = std::move(textureData);
+    return true;
+}
+
+bool drawAtlasSprite(
+    MinecraftUIRenderContext& ctx,
+    float x,
+    float y,
+    int u,
+    int v,
+    bool mirror = false
+) {
+    if (!ensureArmorAtlas(ctx)) {
+        return false;
+    }
+
+    constexpr float kAtlasSize = 128.0f;
+    constexpr float kSpriteSize = 9.0f;
+    glm::vec2 uv(
+        static_cast<float>(u) / kAtlasSize,
+        static_cast<float>(v) / kAtlasSize
+    );
+    glm::vec2 uvSize(kSpriteSize / kAtlasSize, kSpriteSize / kAtlasSize);
+    if (mirror) {
+        uv.x += uvSize.x;
+        uvSize.x = -uvSize.x;
+    }
+
+    ctx.drawImage(
+        gArmorAtlasData->mClientTexture,
+        glm::vec2(x, y),
+        glm::vec2(kSpriteSize, kSpriteSize),
+        uv,
+        uvSize,
+        false
+    );
+    return true;
+}
+
+std::pair<int, int> armorSpriteOffset(
+    PieceRenderState const* piece,
+    bool half,
+    config::ArmorBarConfig const& c
+) {
+    // Exact offsets from Detail Armor Bar Reconstructed's armor_bar.png.
+    // The second texture row is the vanilla-texture variant (+45 px).
+    int u = half ? 54 : 63; // default iron/silver
+    int v = 9;
+
+    if (c.toggleArmorTypes && piece != nullptr && piece->equipped) {
+        const std::string_view id(piece->itemId);
+        if (id.find("netherite") != std::string_view::npos) {
+            u = half ? 0 : 9;
+        } else if (id.find("diamond") != std::string_view::npos) {
+            u = half ? 18 : 27;
+        } else if (id.find("turtle") != std::string_view::npos) {
+            u = half ? 36 : 45;
+        } else if (id.find("chainmail") != std::string_view::npos ||
+                   id.find("chain") != std::string_view::npos) {
+            u = half ? 72 : 81;
+        } else if (id.find("golden") != std::string_view::npos ||
+                   id.find("gold") != std::string_view::npos) {
+            u = half ? 90 : 99;
+        } else if (id.find("leather") != std::string_view::npos) {
+            u = half ? 108 : 117;
+        } else if (id.find("iron") != std::string_view::npos) {
+            u = half ? 54 : 63;
+        } else if (id.find("copper") != std::string_view::npos) {
+            // The original Java atlas does not define copper armor; use the
+            // neutral iron/silver sprite as a stable fallback.
+            u = half ? 54 : 63;
+        }
+    }
+
+    if (c.toggleVanillaTexture) {
+        v += 45;
+    }
+    return {u, v};
+}
+
+PieceRenderState const* pieceForPoint(
+    feature::BarPoint const* point,
+    std::array<PieceRenderState, 4> const& states
+) {
+    if (point == nullptr || point->empty || point->pieceIndex < 0 ||
+        point->pieceIndex >= static_cast<int>(states.size())) {
+        return nullptr;
+    }
+    auto const& state = states[static_cast<std::size_t>(point->pieceIndex)];
+    return state.equipped ? &state : nullptr;
+}
+
+std::pair<int, int> spriteOffsetForPoint(
+    feature::BarPoint const* point,
+    std::array<PieceRenderState, 4> const& states,
+    bool half,
+    config::ArmorBarConfig const& c
+) {
+    // Elytra/special-item slots use the same small item-bar sprite as Java.
+    if (point != nullptr && !point->empty && point->specialItem) {
+        return {36, 0};
+    }
+    return armorSpriteOffset(pieceForPoint(point, states), half, c);
+}
+
+std::uint32_t materialColor(std::string_view id, bool vanillaTexture);
+
+std::uint32_t fallbackColorForPoint(
+    feature::BarPoint const* point,
+    std::array<PieceRenderState, 4> const& states,
+    config::ArmorBarConfig const& c
+) {
+    auto const* piece = pieceForPoint(point, states);
+    return piece != nullptr && c.toggleArmorTypes
+        ? materialColor(piece->itemId, c.toggleVanillaTexture)
+        : 0xffaeb6bfu;
+}
+
+void drawFallbackIcon(
+    MinecraftUIRenderContext& ctx,
+    float x,
+    float y,
+    std::uint32_t color
+);
+
+void drawPointSprite(
+    MinecraftUIRenderContext& ctx,
+    float x,
+    float y,
+    feature::BarPoint const* point,
+    std::array<PieceRenderState, 4> const& states,
+    config::ArmorBarConfig const& c,
+    bool half,
+    bool mirror
+) {
+    const auto [u, v] = spriteOffsetForPoint(point, states, half, c);
+    if (drawAtlasSprite(ctx, x, y, u, v, mirror)) {
+        return;
+    }
+
+    // Last-resort visible fallback only if the packaged atlas cannot be loaded.
+    const auto color = fallbackColorForPoint(point, states, c);
+    if (!half) {
+        drawFallbackIcon(ctx, x, y, color);
+        return;
+    }
+    const float left = mirror ? x + 5.0f : x + 1.0f;
+    fill(ctx, left, y + 1.0f, 3.0f, 7.0f, color);
+}
+
+void drawEmptySprite(
+    MinecraftUIRenderContext& ctx,
+    float x,
+    float y,
+    config::ArmorBarConfig const& c
+) {
+    if (!c.toggleEmptyBar) {
+        return;
+    }
+    if (!drawAtlasSprite(ctx, x, y, 45, 0, false)) {
+        // Empty sprite fallback is deliberately subdued rather than drawing a
+        // second opaque background over the game HUD.
+        outline(ctx, x, y, 8.0f, 9.0f, 0xff59636bu, 0.7f, 1);
+    }
+}
+
+void drawFallbackIcon(
+    MinecraftUIRenderContext& ctx,
+    float x,
+    float y,
+    std::uint32_t color
+) {
+    // Only used when the atlas ZIP is missing/unreadable; the main render path
+    // uses the original Java sprites above.
+    fill(ctx, x + 1.0f, y + 1.0f, 7.0f, 7.0f, color);
+    outline(ctx, x, y, 9.0f, 9.0f, 0xff20252au, 1.0f, 1);
+}
+
 Item const* itemOf(ItemStack const& stack) {
     return stack.isNull() ? nullptr : stack.mItem.get();
 }
@@ -173,29 +423,6 @@ int enchantLevel(
         : EnchantUtils::getEnchantLevel(type, stack);
 }
 
-bool hasProtection(ItemStack const& stack) {
-    return
-        enchantLevel(Enchant::Type::Protection, stack) > 0 ||
-        enchantLevel(Enchant::Type::ProjectileProtection, stack) > 0 ||
-        enchantLevel(Enchant::Type::BlastProtection, stack) > 0 ||
-        enchantLevel(Enchant::Type::FireProtection, stack) > 0;
-}
-
-feature::ProtectionKind protectionKind(ItemStack const& stack) {
-    if (enchantLevel(Enchant::Type::Protection, stack) > 0) {
-        return feature::ProtectionKind::Generic;
-    }
-
-    if (enchantLevel(Enchant::Type::ProjectileProtection, stack) > 0) {
-        return feature::ProtectionKind::Projectile;
-    }
-
-    if (enchantLevel(Enchant::Type::BlastProtection, stack) > 0) {
-        return feature::ProtectionKind::Blast;
-    }
-
-    return feature::ProtectionKind::Fire;
-}
 
 std::uint32_t materialColor(
     std::string_view id,
@@ -405,7 +632,8 @@ int thresholdIndex(int threshold) {
 
 void notifyDurability(
     IClientInstance& client,
-    ItemStack const& stack,
+    int damage,
+    bool hasMending,
     int slotIndex,
     std::string const& itemId,
     float percent,
@@ -414,7 +642,6 @@ void notifyDurability(
     SlotHistory& history =
         gHistory[static_cast<std::size_t>(slotIndex)];
 
-    const int damage = stack.getDamageValue();
     const bool newItem = history.itemId != itemId;
 
     if (newItem) {
@@ -427,7 +654,7 @@ void notifyDurability(
         !newItem &&
         history.lastDamage >= 0 &&
         damage < history.lastDamage &&
-        enchantLevel(Enchant::Type::Mending, stack) > 0
+        hasMending
     ) {
         gLastMendingFrame = gFrame;
     }
@@ -535,7 +762,7 @@ void notifyDurability(
 void renderDurabilityHud(
     MinecraftUIRenderContext& ctx,
     RectangleArea const& screen,
-    Player& player,
+    std::array<PieceRenderState, 4> const& pieces,
     config::ArmorBarConfig const& c
 ) {
     if (!c.toggleDurability || !c.toggleDurabilityOverlay) {
@@ -567,26 +794,13 @@ void renderDurabilityHud(
     y += static_cast<float>(c.durabilityHudOffsetY);
 
     for (int i = 0; i < 4; ++i) {
-        auto const& stack =
-            player.getArmor(
-                kArmorSlots[static_cast<std::size_t>(i)].slot
-            );
-
-        if (stack.isNull() || !stack.isDamageableItem()) {
+        auto const& piece = pieces[static_cast<std::size_t>(i)];
+        if (!piece.equipped || piece.maxDamage <= 0) {
             continue;
         }
 
-        const int max = maxDamage(stack);
-
-        if (max <= 0) {
-            continue;
-        }
-
-        const int damage = std::clamp(
-            static_cast<int>(stack.getDamageValue()),
-            0,
-            max
-        );
+        const int max = piece.maxDamage;
+        const int damage = std::clamp(piece.damage, 0, max);
 
         const float percent = std::clamp(
             (
@@ -628,7 +842,7 @@ void renderDurabilityHud(
             5.0f * scale,
             5.0f * scale,
             materialColor(
-                stack.getRawNameId(),
+                piece.itemId,
                 c.toggleVanillaTexture
             )
         );
@@ -668,93 +882,132 @@ void renderArmorBar(
     IClientInstance& client,
     config::ArmorBarConfig const& c
 ) {
-    feature::ArmorSnapshot snapshot;
-    int armorSum = 0;
+    const bool playerChanged = gCachedStatePlayer != &player;
+    const bool refreshState =
+        playerChanged || !gSnapshotValid ||
+        (gFrame - gLastStateRefreshFrame >= kArmorStateRefreshIntervalFrames);
 
-    std::array<ItemStack const*, 4> stacks{};
-    std::array<std::string, 4> ids{};
-
-    for (std::size_t i = 0; i < kArmorSlots.size(); ++i) {
-        auto const& stack = player.getArmor(kArmorSlots[i].slot);
-
-        stacks[i] = &stack;
-
-        feature::ArmorPiece& piece = snapshot.pieces[i];
-
-        piece.equipped = !stack.isNull();
-        piece.itemId = piece.equipped
-            ? stack.getRawNameId()
-            : std::string{};
-
-        ids[i] = piece.itemId;
-        piece.armorPoints = piece.equipped ? armorValue(stack) : 0;
-
-        piece.damage = piece.equipped
-            ? static_cast<int>(stack.getDamageValue())
-            : 0;
-
-        piece.maxDamage = piece.equipped ? maxDamage(stack) : 0;
-
-        piece.mending =
-            piece.equipped &&
-            enchantLevel(Enchant::Type::Mending, stack) > 0;
-
-        piece.thorns =
-            piece.equipped &&
-            enchantLevel(Enchant::Type::Thorns, stack) > 0;
-
-        piece.enchanted = piece.equipped && stack.isEnchanted();
-
-        piece.hasCustomItemBar =
-            piece.equipped &&
-            c.toggleItemBar &&
-            piece.itemId.find("elytra") != std::string::npos;
-
-        piece.customItemBarPoints = 2;
-        armorSum += piece.armorPoints;
-
-        if (piece.equipped && piece.maxDamage > 0) {
-            const float percent =
-                feature::durabilityPercentRemaining(
-                    piece.damage,
-                    piece.maxDamage
-                );
-
-            if (c.toggleDurability) {
-                notifyDurability(
-                    client,
-                    stack,
-                    static_cast<int>(i),
-                    piece.itemId,
-                    percent,
-                    c
-                );
-            } else {
-                if (
-                    gHistory[i].itemId == piece.itemId &&
-                    gHistory[i].lastDamage >= 0 &&
-                    piece.damage < gHistory[i].lastDamage &&
-                    piece.mending
-                ) {
-                    gLastMendingFrame = gFrame;
-                }
-
-                gHistory[i].itemId = piece.itemId;
-                gHistory[i].lastDamage = piece.damage;
-                gHistory[i].lastPercent = percent;
-            }
-        } else {
-            gHistory[i] = {};
-        }
+    if (playerChanged) {
+        gHistory = {};
+        gLastHealth = -1.0f;
+        gLastHurtFrame = 0;
+        gLastMendingFrame = 0;
+        gSnapshotValid = false;
+        gLayoutCacheValid = false;
     }
 
-    snapshot.reportedArmorValue =
-        std::max(0, player.getArmorValue());
+    if (refreshState) {
+        gCachedStatePlayer = &player;
+        gLastStateRefreshFrame = gFrame;
+        gArmorSnapshot = feature::ArmorSnapshot{};
 
-    snapshot.baseArmor =
-        std::max(0, snapshot.reportedArmorValue - armorSum);
+        int armorSum = 0;
+        for (std::size_t i = 0; i < kArmorSlots.size(); ++i) {
+            auto const& stack = player.getArmor(kArmorSlots[i].slot);
+            auto& state = gPieceStates[i];
+            state = PieceRenderState{};
 
-    auto points = feature::buildBarPointLayout(snapshot, c);
+            feature::ArmorPiece& piece = gArmorSnapshot.pieces[i];
+            state.equipped = !stack.isNull();
+            if (state.equipped) {
+                state.itemId = stack.getRawNameId();
+                state.armorPoints = armorValue(stack);
+                state.damage = static_cast<int>(stack.getDamageValue());
+                state.maxDamage = maxDamage(stack);
+                state.protection = enchantLevel(Enchant::Type::Protection, stack);
+                state.projectileProtection = enchantLevel(Enchant::Type::ProjectileProtection, stack);
+                state.blastProtection = enchantLevel(Enchant::Type::BlastProtection, stack);
+                state.fireProtection = enchantLevel(Enchant::Type::FireProtection, stack);
+                state.mending = enchantLevel(Enchant::Type::Mending, stack) > 0;
+                state.thorns = enchantLevel(Enchant::Type::Thorns, stack) > 0;
+                state.enchanted = stack.isEnchanted();
+                state.hasProtection = state.protection > 0 ||
+                    state.projectileProtection > 0 ||
+                    state.blastProtection > 0 ||
+                    state.fireProtection > 0;
+                state.protectionKind = state.protection > 0
+                    ? feature::ProtectionKind::Generic
+                    : state.projectileProtection > 0
+                        ? feature::ProtectionKind::Projectile
+                        : state.blastProtection > 0
+                            ? feature::ProtectionKind::Blast
+                            : feature::ProtectionKind::Fire;
+            }
+
+            piece.equipped = state.equipped;
+            piece.itemId = state.itemId;
+            piece.armorPoints = state.armorPoints;
+            piece.damage = state.damage;
+            piece.maxDamage = state.maxDamage;
+            piece.mending = state.mending;
+            piece.thorns = state.thorns;
+            piece.enchanted = state.enchanted;
+            // The layout builder checks toggleItemBar itself; don't bake a
+            // transient config toggle into the cached snapshot.
+            piece.hasCustomItemBar = state.equipped &&
+                state.itemId.find("elytra") != std::string::npos;
+            piece.customItemBarPoints = 2;
+            armorSum += piece.armorPoints;
+
+            if (state.equipped && state.maxDamage > 0) {
+                const float percent = feature::durabilityPercentRemaining(
+                    state.damage,
+                    state.maxDamage
+                );
+
+                if (c.toggleDurability) {
+                    notifyDurability(
+                        client,
+                        state.damage,
+                        state.mending,
+                        static_cast<int>(i),
+                        state.itemId,
+                        percent,
+                        c
+                    );
+                } else {
+                    if (
+                        gHistory[i].itemId == state.itemId &&
+                        gHistory[i].lastDamage >= 0 &&
+                        state.damage < gHistory[i].lastDamage &&
+                        state.mending
+                    ) {
+                        gLastMendingFrame = gFrame;
+                    }
+
+                    gHistory[i].itemId = state.itemId;
+                    gHistory[i].lastDamage = state.damage;
+                    gHistory[i].lastPercent = percent;
+                }
+            } else {
+                gHistory[i] = {};
+            }
+        }
+
+        gArmorSnapshot.reportedArmorValue =
+            std::max(0, player.getArmorValue());
+        gArmorSnapshot.baseArmor = std::max(
+            0,
+            gArmorSnapshot.reportedArmorValue - armorSum
+        );
+        gSnapshotValid = true;
+        gLayoutCacheValid = false;
+    }
+
+    auto const& snapshot = gArmorSnapshot;
+    auto const& pieceStates = gPieceStates;
+
+    if (
+        !gLayoutCacheValid ||
+        gLastToggleItemBar != c.toggleItemBar ||
+        gLastToggleSortSpecialItem != c.toggleSortSpecialItem
+    ) {
+        gCachedPoints = feature::buildBarPointLayout(snapshot, c);
+        gLastToggleItemBar = c.toggleItemBar;
+        gLastToggleSortSpecialItem = c.toggleSortSpecialItem;
+        gLayoutCacheValid = true;
+    }
+    auto const& points = gCachedPoints;
     const int totalPoints = static_cast<int>(points.size());
 
     if (totalPoints == 0 && c.toggleHideBarWithoutArmor) {
@@ -782,9 +1035,12 @@ void renderArmorBar(
     const float screenRight = screen._x1;
     const float screenBottom = screen._y1;
 
+    // Bedrock centers the hotbar, while the native armor points occupy the
+    // left portion of the status HUD. Start the replacement row above hearts.
+    // The config offsets remain available for different GUI scales/safe areas.
     const float baseX =
         (screenLeft + screenRight) * 0.5f -
-        45.0f +
+        kBaseXOffsetFromCenter +
         static_cast<float>(c.armorBarOffsetX);
 
     const float baseY =
@@ -794,42 +1050,38 @@ void renderArmorBar(
         static_cast<float>(rows - 1) * 10.0f;
 
     bool anyProtection = false;
+    std::array<std::uint32_t, 4> protectionColors{};
+    for (std::size_t i = 0; i < pieceStates.size(); ++i) {
+        auto const& state = pieceStates[i];
+        anyProtection = anyProtection || state.hasProtection;
 
-    int genericUnits = 0;
-    int projectileUnits = 0;
-    int blastUnits = 0;
-    int fireUnits = 0;
-
-    for (auto const* ptr : stacks) {
-        if (!ptr || ptr->isNull()) {
-            continue;
-        }
-
-        const int generic =
-            enchantLevel(Enchant::Type::Protection, *ptr);
-
-        const int projectile =
-            enchantLevel(Enchant::Type::ProjectileProtection, *ptr);
-
-        const int blast =
-            enchantLevel(Enchant::Type::BlastProtection, *ptr);
-
-        const int fire =
-            enchantLevel(Enchant::Type::FireProtection, *ptr);
-
-        genericUnits += generic + (generic > 0 ? 1 : 0);
-        projectileUnits += projectile;
-        blastUnits += blast;
-        fireUnits += fire;
-
-        anyProtection =
-            anyProtection ||
-            (generic + projectile + blast + fire > 0);
+        protectionColors[i] = c.toggleUniformColor
+            ? c.uniformColorArgb
+            : feature::protectionColor(state.protectionKind, c);
     }
 
-    std::vector<std::uint32_t> unalignedColors;
 
-    auto appendProtection = [&](
+    std::vector<std::uint32_t> unalignedColors;
+    // This data is only used by the unaligned-protection mode. Avoid allocating
+    // and filling a vector every frame when the default aligned mode is enabled.
+    if (c.toggleEnchants && !c.toggleAlignEnchantments) {
+        int genericUnits = 0;
+        int projectileUnits = 0;
+        int blastUnits = 0;
+        int fireUnits = 0;
+
+        for (auto const& state : pieceStates) {
+            genericUnits += state.protection + (state.protection > 0 ? 1 : 0);
+            projectileUnits += state.projectileProtection;
+            blastUnits += state.blastProtection;
+            fireUnits += state.fireProtection;
+        }
+
+        unalignedColors.reserve(static_cast<std::size_t>(
+            genericUnits + projectileUnits + blastUnits + fireUnits
+        ));
+
+        auto appendProtection = [&](
         feature::ProtectionKind kind,
         int count
     ) {
@@ -842,308 +1094,203 @@ void renderArmorBar(
         }
     };
 
-    appendProtection(feature::ProtectionKind::Generic, genericUnits);
-    appendProtection(feature::ProtectionKind::Projectile, projectileUnits);
-    appendProtection(feature::ProtectionKind::Blast, blastUnits);
-    appendProtection(feature::ProtectionKind::Fire, fireUnits);
-
-    if (
-        gLastHealth >= 0.0f &&
-        static_cast<float>(player.getHealth()) < gLastHealth
-    ) {
-        gLastHurtFrame = gFrame;
+        appendProtection(feature::ProtectionKind::Generic, genericUnits);
+        appendProtection(feature::ProtectionKind::Projectile, projectileUnits);
+        appendProtection(feature::ProtectionKind::Blast, blastUnits);
+        appendProtection(feature::ProtectionKind::Fire, fireUnits);
     }
 
-    gLastHealth = static_cast<float>(player.getHealth());
+    const float currentHealth = static_cast<float>(player.getHealth());
+    if (gLastHealth >= 0.0f && currentHealth < gLastHealth) {
+        gLastHurtFrame = gFrame;
+    }
+    gLastHealth = currentHealth;
 
-    for (int pointIndex = 0; pointIndex < drawPoints; ++pointIndex) {
-        const int row = pointIndex / kArmorPointsPerRow;
-        const int inRow = pointIndex % kArmorPointsPerRow;
+    const float protectionOverlayPulse =
+        protectionPulse(c.effectType, c.effectSpeed, gFrame);
 
-        int iconColumn = inRow / 2;
-        const bool secondHalf = (inRow % 2) != 0;
-
-        if (c.toggleInverseSlot) {
-            iconColumn = kIconsPerRow - 1 - iconColumn;
-        }
-
-        const float x =
-            baseX + static_cast<float>(iconColumn * kIconWidth);
-
-        const float y =
-            baseY + static_cast<float>(row * 10);
-
-        const float halfX =
-            x + (secondHalf != c.toggleInverseSlot ? 5.0f : 1.0f);
-
-        const float halfW = static_cast<float>(kHalfPointWidth);
-
-        fill(ctx, x + 1.0f, y + 1.0f, 7.0f, 7.0f, 0xff20252au);
-        outline(ctx, x, y, 9.0f, 9.0f, 0xff7a838bu, 0.9f, 1);
-
-        if (pointIndex >= static_cast<int>(points.size())) {
-            continue;
-        }
-
-        const feature::BarPoint& point =
-            points[static_cast<std::size_t>(pointIndex)];
-
-        if (point.empty) {
-            continue;
-        }
-
-        std::uint32_t baseColor = 0xffaeb6bfu;
-        ItemStack const* pieceStack = nullptr;
-
-        if (point.pieceIndex >= 0 && point.pieceIndex < 4) {
-            pieceStack =
-                stacks[static_cast<std::size_t>(point.pieceIndex)];
-
-            if (pieceStack && !pieceStack->isNull()) {
-                if (c.toggleArmorTypes) {
-                    baseColor = materialColor(
-                        ids[static_cast<std::size_t>(point.pieceIndex)],
-                        c.toggleVanillaTexture
-                    );
-                } else {
-                    baseColor = 0xffaeb6bfu;
-                }
-            }
-        }
-
-        fill(ctx, halfX, y + 1.0f, halfW, 7.0f, baseColor);
+    // Durability warning math (including the pulse sine) only needs to run once
+    // per equipped piece, not once for every half-point of that piece.
+    for (std::size_t i = 0; i < pieceStates.size(); ++i) {
+        auto& state = pieceStates[i];
+        state.durabilityWarningAlpha = 0.0f;
+        state.durabilityWarningColor = 0;
 
         if (
-            c.toggleEnchants &&
-            c.effectType != "NONE" &&
-            c.toggleAlignEnchantments &&
-            c.toggleUniformColor &&
-            anyProtection
+            !state.equipped || state.maxDamage <= 0 ||
+            !c.toggleDurability || !c.toggleDurabilityNotifications ||
+            !c.toggleDurabilityVisualEffect
         ) {
-            const float pulse =
-                protectionPulse(c.effectType, c.effectSpeed, gFrame);
-
-            if (c.effectType == "OUTLINE") {
-                outline(
-                    ctx,
-                    halfX,
-                    y + 1.0f,
-                    halfW,
-                    7.0f,
-                    c.uniformColorArgb,
-                    pulse,
-                    1
-                );
-            } else {
-                fill(
-                    ctx,
-                    halfX,
-                    y + 1.0f,
-                    halfW,
-                    7.0f,
-                    c.uniformColorArgb,
-                    pulse
-                );
-            }
+            continue;
         }
 
-        if (pieceStack && !pieceStack->isNull()) {
-            const bool protectedPiece = hasProtection(*pieceStack);
+        const float percent = feature::durabilityPercentRemaining(
+            state.damage, state.maxDamage
+        );
+        const auto warning = feature::durabilityWarning(percent, c);
+        const auto lastNotice = gHistory[i].lastNotificationFrame;
+        if (warning.level == feature::DurabilityLevel::None || lastNotice == 0) {
+            continue;
+        }
 
-            if (
-                c.toggleEnchants &&
-                c.toggleAlignEnchantments &&
-                !c.toggleUniformColor &&
-                protectedPiece &&
-                c.effectType != "NONE"
-            ) {
-                const std::uint32_t protectionArgb =
-                    feature::protectionColor(
-                        protectionKind(*pieceStack),
-                        c
-                    );
+        const auto elapsed = gFrame - lastNotice;
+        if (c.toggleRepeatedDurabilityNotifications) {
+            state.durabilityWarningAlpha = 0.45f + 0.45f *
+                (0.5f + 0.5f * std::sin(static_cast<float>(gFrame) * 0.22f));
+        } else if (elapsed < 40) {
+            state.durabilityWarningAlpha =
+                1.0f - static_cast<float>(elapsed) / 40.0f;
+        }
+        state.durabilityWarningColor = warning.colorArgb;
+    }
 
-                const float pulse =
-                    protectionPulse(c.effectType, c.effectSpeed, gFrame);
+    auto pointAt = [&points](int index) -> feature::BarPoint const* {
+        if (index < 0 || index >= static_cast<int>(points.size())) {
+            return nullptr;
+        }
+        return &points[static_cast<std::size_t>(index)];
+    };
 
-                if (c.effectType == "OUTLINE") {
-                    outline(
-                        ctx,
-                        halfX,
-                        y + 1.0f,
-                        halfW,
-                        7.0f,
-                        protectionArgb,
-                        pulse,
-                        1
-                    );
+    // Render ten 9x9 atlas sprites with an 8px stride, just like the Java mod.
+    // This is the base HUD pass. Vanilla HudArmorRenderer is hooked below, so
+    // it does not draw the default armor row on top of these sprites.
+    for (int row = 0; row < rows; ++row) {
+        for (int iconColumnInRow = 0; iconColumnInRow < kIconsPerRow; ++iconColumnInRow) {
+            const int iconColumn = c.toggleInverseSlot
+                ? kIconsPerRow - 1 - iconColumnInRow
+                : iconColumnInRow;
+            const float x = baseX + static_cast<float>(iconColumn * kIconWidth);
+            const float y = baseY + static_cast<float>(row * 10);
+            const int firstIndex = row * kArmorPointsPerRow + iconColumnInRow * 2;
+            auto const* first = pointAt(firstIndex);
+            auto const* second = pointAt(firstIndex + 1);
+            const bool firstPresent = first != nullptr && !first->empty;
+            const bool secondPresent = second != nullptr && !second->empty;
+
+            if (firstPresent && secondPresent) {
+                const auto firstHalf = spriteOffsetForPoint(first, pieceStates, true, c);
+                const auto secondHalf = spriteOffsetForPoint(second, pieceStates, true, c);
+                const bool sameBar = first->specialItem == second->specialItem &&
+                                     firstHalf == secondHalf;
+                if (sameBar) {
+                    drawPointSprite(ctx, x, y, first, pieceStates, c, false, false);
                 } else {
-                    fill(
-                        ctx,
-                        halfX,
-                        y + 1.0f,
-                        halfW,
-                        7.0f,
-                        protectionArgb,
-                        pulse
-                    );
+                    // Match Java: draw the right half mirrored first, then the
+                    // left half. The atlas provides separate material halves.
+                    drawPointSprite(ctx, x, y, second, pieceStates, c, true, true);
+                    drawPointSprite(ctx, x, y, first, pieceStates, c, true, false);
+                }
+            } else if (firstPresent) {
+                drawEmptySprite(ctx, x, y, c);
+                drawPointSprite(ctx, x, y, first, pieceStates, c, true, false);
+            } else if (secondPresent) {
+                drawEmptySprite(ctx, x, y, c);
+                drawPointSprite(ctx, x, y, second, pieceStates, c, true, true);
+            } else {
+                drawEmptySprite(ctx, x, y, c);
+            }
+        }
+    }
+
+    // Effects are grouped per 9x9 icon rather than redrawing a fill/outline for
+    // every half-point. That is materially cheaper on low-end integrated GPUs.
+    for (int row = 0; row < rows; ++row) {
+        for (int iconColumnInRow = 0; iconColumnInRow < kIconsPerRow; ++iconColumnInRow) {
+            const int iconColumn = c.toggleInverseSlot
+                ? kIconsPerRow - 1 - iconColumnInRow
+                : iconColumnInRow;
+            const float x = baseX + static_cast<float>(iconColumn * kIconWidth);
+            const float y = baseY + static_cast<float>(row * 10);
+            const int firstIndex = row * kArmorPointsPerRow + iconColumnInRow * 2;
+            auto const* first = pointAt(firstIndex);
+            auto const* second = pointAt(firstIndex + 1);
+            auto const* firstPiece = pieceForPoint(first, pieceStates);
+            auto const* secondPiece = pieceForPoint(second, pieceStates);
+
+            if ((first == nullptr || first->empty) &&
+                (second == nullptr || second->empty)) {
+                continue;
+            }
+
+            PieceRenderState const* effectPiece = firstPiece;
+            if (effectPiece == nullptr || !effectPiece->hasProtection) {
+                effectPiece = secondPiece;
+            }
+            if (effectPiece == nullptr) {
+                continue;
+            }
+
+            bool hasProtectionOverlay = false;
+            std::uint32_t protectionArgb = 0;
+            if (c.toggleEnchants && c.effectType != "NONE" && anyProtection) {
+                if (c.toggleUniformColor) {
+                    hasProtectionOverlay = effectPiece->hasProtection;
+                    protectionArgb = c.uniformColorArgb;
+                } else if (effectPiece->hasProtection) {
+                    hasProtectionOverlay = true;
+                    protectionArgb = protectionColors[
+                        static_cast<std::size_t>(effectPiece - pieceStates.data())
+                    ];
                 }
             }
 
-            if (
-                c.toggleThorns &&
-                enchantLevel(Enchant::Type::Thorns, *pieceStack) > 0
-            ) {
+            if (hasProtectionOverlay) {
+                if (c.effectType == "OUTLINE") {
+                    outline(ctx, x, y, 9.0f, 9.0f,
+                            protectionArgb, protectionOverlayPulse, 1);
+                } else if (c.effectType == "AURA" || c.effectType == "STATIC") {
+                    fill(ctx, x + 1.0f, y + 1.0f, 7.0f, 7.0f,
+                         protectionArgb, c.effectType == "AURA"
+                             ? std::max(0.12f, protectionOverlayPulse * 0.30f)
+                             : 0.20f);
+                }
+            }
+
+            const bool hasThorns =
+                (firstPiece != nullptr && firstPiece->thorns) ||
+                (secondPiece != nullptr && secondPiece->thorns);
+            if (c.toggleThorns && hasThorns) {
                 float thornAlpha = 1.0f;
                 std::uint32_t thornColor = 0xffffffffu;
-
-                const int duration =
-                    feature::thornsAnimationDurationTicks(c.effectSpeed);
-
+                const int duration = feature::thornsAnimationDurationTicks(c.effectSpeed);
                 const auto elapsed = gFrame - gLastHurtFrame;
-
-                if (
-                    c.effectThorn == "ANIMATION" &&
-                    gLastHurtFrame != 0 &&
-                    elapsed < static_cast<std::uint64_t>(duration)
-                ) {
-                    thornColor =
-                        elapsed < static_cast<std::uint64_t>(duration / 2)
-                        ? 0xffff3b3bu
-                        : 0xffffa0a0u;
-
-                    thornAlpha =
-                        0.45f +
-                        0.55f *
-                            static_cast<float>(
-                                duration - static_cast<int>(elapsed)
-                            ) /
-                            static_cast<float>(duration);
+                if (c.effectThorn == "ANIMATION" && gLastHurtFrame != 0 &&
+                    elapsed < static_cast<std::uint64_t>(duration)) {
+                    thornColor = elapsed < static_cast<std::uint64_t>(duration / 2)
+                        ? 0xffff3b3bu : 0xffffa0a0u;
+                    thornAlpha = 0.45f + 0.55f *
+                        static_cast<float>(duration - static_cast<int>(elapsed)) /
+                        static_cast<float>(duration);
                 }
-
-                outline(
-                    ctx,
-                    halfX,
-                    y + 1.0f,
-                    halfW,
-                    7.0f,
-                    thornColor,
-                    thornAlpha,
-                    1
-                );
+                outline(ctx, x, y, 9.0f, 9.0f, thornColor, thornAlpha, 1);
             }
 
-            if (
-                c.toggleMending &&
-                enchantLevel(Enchant::Type::Mending, *pieceStack) > 0 &&
-                (gFrame % 16) < 9
-            ) {
-                const float sparkleX = halfX + halfW * 0.5f;
-
-                fill(
-                    ctx,
-                    sparkleX,
-                    y - 1.0f,
-                    1.0f,
-                    3.0f,
-                    0xffffffffu
-                );
-
-                fill(
-                    ctx,
-                    sparkleX - 1.0f,
-                    y,
-                    3.0f,
-                    1.0f,
-                    0xffffffffu
-                );
+            const bool hasMending =
+                (firstPiece != nullptr && firstPiece->mending) ||
+                (secondPiece != nullptr && secondPiece->mending);
+            if (c.toggleMending && hasMending && (gFrame % 16) < 9) {
+                const float sparkleX = x + 4.0f;
+                fill(ctx, sparkleX, y - 1.0f, 1.0f, 3.0f, 0xffffffffu);
+                fill(ctx, sparkleX - 1.0f, y, 3.0f, 1.0f, 0xffffffffu);
+            }
+            if (c.toggleMending && hasMending && gLastMendingFrame != 0 &&
+                gFrame - gLastMendingFrame < 12) {
+                const float flash = (gFrame - gLastMendingFrame) % 6 < 3 ? 1.0f : 0.35f;
+                outline(ctx, x, y, 9.0f, 9.0f, 0xffffffffu, flash, 1);
             }
 
-            if (
-                c.toggleMending &&
-                enchantLevel(Enchant::Type::Mending, *pieceStack) > 0 &&
-                gLastMendingFrame != 0 &&
-                gFrame - gLastMendingFrame < 12
-            ) {
-                const float flash =
-                    (gFrame - gLastMendingFrame) % 6 < 3
-                    ? 1.0f
-                    : 0.35f;
-
-                outline(
-                    ctx,
-                    halfX,
-                    y + 1.0f,
-                    halfW,
-                    7.0f,
-                    0xffffffffu,
-                    flash,
-                    1
-                );
-            }
-
-            const int max = maxDamage(*pieceStack);
-
-            if (
-                c.toggleDurability &&
-                c.toggleDurabilityNotifications &&
-                c.toggleDurabilityVisualEffect &&
-                max > 0 &&
-                point.pieceIndex >= 0 &&
-                point.pieceIndex < 4
-            ) {
-                const float percent =
-                    feature::durabilityPercentRemaining(
-                        static_cast<int>(pieceStack->getDamageValue()),
-                        max
-                    );
-
-                const auto warning =
-                    feature::durabilityWarning(percent, c);
-
-                const auto lastNotice =
-                    gHistory[
-                        static_cast<std::size_t>(point.pieceIndex)
-                    ].lastNotificationFrame;
-
-                if (
-                    warning.level != feature::DurabilityLevel::None &&
-                    lastNotice != 0
-                ) {
-                    const auto elapsed = gFrame - lastNotice;
-                    float warningAlpha = 0.0f;
-
-                    if (c.toggleRepeatedDurabilityNotifications) {
-                        warningAlpha =
-                            0.45f +
-                            0.45f *
-                                (
-                                    0.5f +
-                                    0.5f *
-                                        std::sin(
-                                            static_cast<float>(gFrame) *
-                                            0.22f
-                                        )
-                                );
-                    } else if (elapsed < 40) {
-                        warningAlpha =
-                            1.0f -
-                            static_cast<float>(elapsed) / 40.0f;
-                    }
-
-                    if (warningAlpha > 0.0f) {
-                        outline(
-                            ctx,
-                            halfX,
-                            y + 1.0f,
-                            halfW,
-                            7.0f,
-                            warning.colorArgb,
-                            warningAlpha,
-                            1
-                        );
-                    }
+            PieceRenderState const* durabilityPiece = nullptr;
+            for (auto const* candidate : {firstPiece, secondPiece}) {
+                if (candidate != nullptr && candidate->durabilityWarningAlpha > 0.0f &&
+                    (durabilityPiece == nullptr ||
+                     candidate->durabilityWarningAlpha > durabilityPiece->durabilityWarningAlpha)) {
+                    durabilityPiece = candidate;
                 }
+            }
+            if (c.toggleDurabilityVisualEffect && durabilityPiece != nullptr) {
+                outline(ctx, x, y, 9.0f, 9.0f,
+                        durabilityPiece->durabilityWarningColor,
+                        durabilityPiece->durabilityWarningAlpha, 1);
             }
         }
     }
@@ -1176,14 +1323,13 @@ void renderArmorBar(
                 baseY + static_cast<float>(row * 10);
 
             const float halfX =
-                x + (secondHalf != c.toggleInverseSlot ? 5.0f : 1.0f);
+                x + (secondHalf != c.toggleInverseSlot ? 4.0f : 1.0f);
             const float w = static_cast<float>(kHalfPointWidth);
 
             const auto color =
                 unalignedColors[static_cast<std::size_t>(pointIndex)];
 
-            const float pulse =
-                protectionPulse(c.effectType, c.effectSpeed, gFrame);
+            const float pulse = protectionOverlayPulse;
 
             if (c.effectType == "OUTLINE") {
                 outline(ctx, halfX, y + 1.0f, w, 7.0f, color, pulse, 1);
@@ -1205,7 +1351,7 @@ void renderArmorBar(
 
             const float x = c.toggleInverseOverflowIcon
                 ? baseX + 80.0f - shift
-                : baseX + 90.0f + shift;
+                : baseX + 80.0f + shift;
 
             const float y = baseY + 1.0f;
 
@@ -1214,63 +1360,80 @@ void renderArmorBar(
         }
     }
 
-    renderDurabilityHud(ctx, screen, player, c);
+    renderDurabilityHud(ctx, screen, pieceStates, c);
 }
 
 } // namespace
 
-bool installArmorHudRenderer(config::ArmorBarConfig& config) {
+// Replace the game's exact armor HUD render call. Unlike AfterUIRenderEvent,
+// this fires only for the native armor row, so the mod does not repaint HUDs for
+// unrelated screens or use a changing clipping rectangle from other UI layers.
+LL_TYPE_INSTANCE_HOOK(
+    VanillaHudArmorRendererHook,
+    ll::memory::HookPriority::High,
+    HudArmorRenderer,
+    render,
+    void,
+    MinecraftUIRenderContext& renderContext,
+    IClientInstance& client,
+    UIControl& owner,
+    int pass
+) {
+    (void)owner;
+    (void)pass;
+    auto* player = client.getLocalPlayer();
+    if (gConfig == nullptr || player == nullptr) {
+        return;
+    }
+    ++gFrame;
+    // HudArmorRenderer can be invoked under a control-local scissor. Temporarily
+    // use the full HUD viewport so the replacement atlas row is not clipped to
+    // the vanilla control's original glyph bounds.
+    renderContext.saveCurrentClippingRectangle();
+    renderContext.setFullClippingRectangle();
+    const auto screen = renderContext.getFullClippingRectangle();
+    renderArmorBar(renderContext, screen, *player, client, *gConfig);
+    renderContext.restoreSavedClippingRectangle();
+}
+
+bool installArmorHudRenderer(
+    config::ArmorBarConfig& config,
+    std::filesystem::path armorAtlasArchive
+) {
     gConfig = &config;
+    gArmorAtlasArchive = std::move(armorAtlasArchive);
+    gArmorAtlasData.reset();
+    gArmorAtlasLoadAttempted = false;
 
-    gHudListener =
-        ll::event::EventBus::getInstance()
-            .emplaceListener<ll::event::AfterUIRenderEvent>(
-                [](ll::event::AfterUIRenderEvent& event) {
-                    if (gConfig == nullptr) {
-                        return;
-                    }
-
-                    ++gFrame;
-
-                    auto& context = event.uiRenderContext();
-                    auto& client = context.mClient;
-                    auto* player = client.getLocalPlayer();
-
-                    if (player == nullptr) {
-                        return;
-                    }
-
-                    const auto screen =
-                        context.getFullClippingRectangle();
-
-                    renderArmorBar(
-                        context,
-                        screen,
-                        *player,
-                        client,
-                        *gConfig
-                    );
-                }
-            );
-
-    return static_cast<bool>(gHudListener);
+    if (!gVanillaHudHookInstalled) {
+        VanillaHudArmorRendererHook::hook();
+        gVanillaHudHookInstalled = true;
+    }
+    return gVanillaHudHookInstalled;
 }
 
 void uninstallArmorHudRenderer() {
-    if (gHudListener) {
-        ll::event::EventBus::getInstance().removeListener(
-            gHudListener
-        );
-
-        gHudListener.reset();
+    if (gVanillaHudHookInstalled) {
+        VanillaHudArmorRendererHook::unhook();
+        gVanillaHudHookInstalled = false;
     }
 
     gConfig = nullptr;
+    gCachedStatePlayer = nullptr;
+    gLastStateRefreshFrame = 0;
+    gSnapshotValid = false;
+    gLayoutCacheValid = false;
+    gPieceStates = {};
+    gArmorSnapshot = feature::ArmorSnapshot{};
+    gCachedPoints.clear();
     gFrame = 0;
     gHistory = {};
     gLastHealth = -1.0f;
     gLastHurtFrame = 0;
     gLastMendingFrame = 0;
+    gArmorAtlasData.reset();
+    gArmorAtlasArchive.clear();
+    gArmorAtlasLoadAttempted = false;
 }
 
 } // namespace dab::render

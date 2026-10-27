@@ -2,11 +2,17 @@
 
 #include "../config/ArmorBarConfig.h"
 
+#include <filesystem>
+
 namespace dab::render {
 
-// Installs the local-client UI render adapter. It reads the player's equipped armor
-// and draws the Bedrock-native version of the detail armor HUD.
-bool installArmorHudRenderer(config::ArmorBarConfig& config);
+// Hooks the native Bedrock armor HUD renderer and replaces its icons with the
+// Detail Armor Bar atlas. The archive must contain textures/armor_bar.png.
+bool installArmorHudRenderer(
+    config::ArmorBarConfig& config,
+    std::filesystem::path armorAtlasArchive
+);
 void uninstallArmorHudRenderer();
+
 
 } // namespace dab::render

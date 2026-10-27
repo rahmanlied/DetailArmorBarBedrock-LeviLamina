@@ -444,18 +444,52 @@ build_script:
               -Force
       }
 
-      # Manifest paket mod.
-      @{
+      # Package the Java atlas in the ZIP layout expected by
+      # MinecraftUIRenderContext::getZippedTexture("textures/armor_bar").
+      $atlasSource = Join-Path $repo 'resources/java-reference/textures/armor_bar.png'
+      if (-not (Test-Path -LiteralPath $atlasSource)) {
+          throw "Required armor atlas is missing: $atlasSource"
+      }
+
+      $resources = Join-Path $dist 'resources'
+      New-Item -ItemType Directory -Force -Path $resources | Out-Null
+
+      $atlasStage = Join-Path $repo '.ci-tools\DetailArmorBarBedrock-atlas-stage'
+      if (Test-Path -LiteralPath $atlasStage) {
+          Remove-Item -LiteralPath $atlasStage -Recurse -Force
+      }
+      $atlasTextures = Join-Path $atlasStage 'textures'
+      New-Item -ItemType Directory -Force -Path $atlasTextures | Out-Null
+      Copy-Item `
+          -LiteralPath $atlasSource `
+          -Destination (Join-Path $atlasTextures 'armor_bar.png') `
+          -Force
+
+      $atlasZip = Join-Path $resources 'DetailArmorBarBedrockTextures.zip'
+      if (Test-Path -LiteralPath $atlasZip) {
+          Remove-Item -LiteralPath $atlasZip -Force
+      }
+      Compress-Archive `
+          -Path (Join-Path $atlasStage 'textures') `
+          -DestinationPath $atlasZip `
+          -Force
+      Remove-Item -LiteralPath $atlasStage -Recurse -Force
+
+      # Manifest paket mod. Write UTF-8 without BOM because the BMCBL
+      # manifest reader rejects a BOM at byte zero (expected value at line 1 column 1).
+      $manifestJson = @{
           name = 'DetailArmorBarBedrock'
           entry = 'DetailArmorBarBedrock.dll'
           version = '0.2.0-dev'
           type = 'native'
           platform = 'client'
-      } |
-          ConvertTo-Json |
-          Set-Content `
-              -Path (Join-Path $dist 'manifest.json') `
-              -Encoding UTF8
+      } | ConvertTo-Json
+
+      [System.IO.File]::WriteAllText(
+          (Join-Path $dist 'manifest.json'),
+          $manifestJson + [Environment]::NewLine,
+          [System.Text.UTF8Encoding]::new($false)
+      )
 
       # Buat ZIP distribusi.
       $zipOutput = Join-Path $repo 'DetailArmorBarBedrock-client-windows-x64.zip'

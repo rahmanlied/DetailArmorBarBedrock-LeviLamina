@@ -36,6 +36,9 @@ target("DetailArmorBarBedrock")
     add_includedirs("src")
     add_packages("levilamina", "nlohmann_json")
     add_defines("NOMINMAX", "UNICODE", "_UNICODE")
+    if is_plat("windows") then
+        add_syslinks("user32") -- GetAsyncKeyState / foreground-window check for F8
+    end
 target_end()
 
 -- Pure logic tests: no Bedrock runtime required.
