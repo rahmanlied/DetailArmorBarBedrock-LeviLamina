@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <system_error>
 #include <memory>
 #include <utility>
 #include <string>
@@ -47,12 +48,13 @@ constexpr int kIconsPerRow = 10;
 // The vanilla armor row is left-aligned above the hearts in Bedrock HUD.
 // These defaults target that row instead of drawing a second bar at screen center.
 constexpr float kBaseXOffsetFromCenter = 91.0f;
-constexpr int kBaseYFromBottom = 49;
+constexpr int kBaseYFromBottom = 59;
 
 config::ArmorBarConfig* gConfig = nullptr;
 std::filesystem::path gArmorAtlasArchive;
 std::shared_ptr<BedrockTextureData const> gArmorAtlasData;
 bool gArmorAtlasLoadAttempted = false;
+std::uint64_t gLastArmorAtlasAttemptFrame = 0;
 bool gVanillaHudHookInstalled = false;
 std::uint64_t gFrame = 0;
 
@@ -103,7 +105,7 @@ struct PieceRenderState {
 
 // Armor properties/enchantments are expensive native queries. Refresh them at
 // a short interval and reuse the last snapshot on intermediate UI frames.
-constexpr std::uint64_t kArmorStateRefreshIntervalFrames = 8;
+constexpr std::uint64_t kArmorStateRefreshIntervalFrames = 12;
 std::array<PieceRenderState, 4> gPieceStates{};
 feature::ArmorSnapshot gArmorSnapshot{};
 Player* gCachedStatePlayer = nullptr;
@@ -199,20 +201,42 @@ void outline(
 // texture is held as BedrockTextureData so the UI renderer can reuse the same
 // GPU texture on every subsequent frame (no per-frame texture lookup).
 bool ensureArmorAtlas(MinecraftUIRenderContext& ctx) {
-    if (gArmorAtlasLoadAttempted) {
-        return static_cast<bool>(gArmorAtlasData);
+    if (gArmorAtlasData) {
+        return true;
+    }
+
+    // A failed first lookup can happen before the client texture pipeline is
+    // ready. Do not permanently lock the HUD into rectangle fallbacks; retry
+    // at a low frequency so a missing archive does not add work every frame.
+    constexpr std::uint64_t kAtlasRetryIntervalFrames = 120;
+    if (gArmorAtlasLoadAttempted &&
+        gFrame - gLastArmorAtlasAttemptFrame < kAtlasRetryIntervalFrames) {
+        return false;
     }
     gArmorAtlasLoadAttempted = true;
+    gLastArmorAtlasAttemptFrame = gFrame;
 
+    std::error_code filesystemError;
     if (gArmorAtlasArchive.empty() ||
-        !std::filesystem::exists(gArmorAtlasArchive)) {
+        !std::filesystem::exists(gArmorAtlasArchive, filesystemError)) {
         return false;
     }
 
     const Core::Path zipPath(gArmorAtlasArchive);
     const ResourceLocation atlasLocation{Core::PathView{"textures/armor_bar"}};
-    auto texture = ctx.getZippedTexture(zipPath, atlasLocation, false);
+    auto texture = ctx.getZippedTexture(zipPath, atlasLocation, true);
     std::shared_ptr<BedrockTextureData const> textureData = texture.mClientTexture;
+    if (!textureData) {
+        // Some resource loaders expect the full archive entry name rather
+        // than the texture's extensionless ResourceLocation.
+        const ResourceLocation atlasLocationWithExtension{
+            Core::PathView{"textures/armor_bar.png"}
+        };
+        auto textureWithExtension = ctx.getZippedTexture(
+            zipPath, atlasLocationWithExtension, true
+        );
+        textureData = textureWithExtension.mClientTexture;
+    }
     if (!textureData) {
         return false;
     }
@@ -1411,6 +1435,7 @@ bool installArmorHudRenderer(
     gArmorAtlasArchive = std::move(armorAtlasArchive);
     gArmorAtlasData.reset();
     gArmorAtlasLoadAttempted = false;
+    gLastArmorAtlasAttemptFrame = 0;
 
     if (!gVanillaHudHookInstalled) {
         VanillaHudArmorRendererHook::hook();
@@ -1441,6 +1466,7 @@ void uninstallArmorHudRenderer() {
     gArmorAtlasData.reset();
     gArmorAtlasArchive.clear();
     gArmorAtlasLoadAttempted = false;
+    gLastArmorAtlasAttemptFrame = 0;
 }
 
 } // namespace dab::render
