@@ -1112,7 +1112,7 @@ void renderArmorBar(
     // Durability warning math (including the pulse sine) only needs to run once
     // per equipped piece, not once for every half-point of that piece.
     for (std::size_t i = 0; i < pieceStates.size(); ++i) {
-        auto& state = pieceStates[i];
+        auto& state = gPieceStates[i];
         state.durabilityWarningAlpha = 0.0f;
         state.durabilityWarningColor = 0;
 
