@@ -43,6 +43,7 @@ constexpr int kIconWidth = 8;
 constexpr int kIconHeight = 9;
 constexpr int kArmorPointsPerRow = 20;
 constexpr int kIconsPerRow = 10;
+
 // The vanilla armor row is left-aligned above the hearts in Bedrock HUD.
 // These defaults target that row instead of drawing a second bar at screen center.
 constexpr float kBaseXOffsetFromCenter = 91.0f;
@@ -1372,7 +1373,7 @@ LL_TYPE_INSTANCE_HOOK(
     VanillaHudArmorRendererHook,
     ll::memory::HookPriority::High,
     HudArmorRenderer,
-    render,
+    &HudArmorRenderer::$render,
     void,
     MinecraftUIRenderContext& renderContext,
     IClientInstance& client,
