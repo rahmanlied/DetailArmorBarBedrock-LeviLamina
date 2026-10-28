@@ -268,26 +268,32 @@ std::pair<int, int> armorSpriteOffset(
 
     if (c.toggleArmorTypes && piece != nullptr && piece->equipped) {
         const std::string_view id(piece->itemId);
+
         if (id.find("netherite") != std::string_view::npos) {
             u = half ? 0 : 9;
         } else if (id.find("diamond") != std::string_view::npos) {
             u = half ? 18 : 27;
         } else if (id.find("turtle") != std::string_view::npos) {
             u = half ? 36 : 45;
-        } else if (id.find("chainmail") != std::string_view::npos ||
-                   id.find("chain") != std::string_view::npos) {
+        } else if (
+            id.find("chainmail") != std::string_view::npos ||
+            id.find("chain") != std::string_view::npos
+        ) {
             u = half ? 72 : 81;
-        } else if (id.find("golden") != std::string_view::npos ||
-                   id.find("gold") != std::string_view::npos) {
+        } else if (
+            id.find("golden") != std::string_view::npos ||
+            id.find("gold") != std::string_view::npos
+        ) {
             u = half ? 90 : 99;
         } else if (id.find("leather") != std::string_view::npos) {
             u = half ? 108 : 117;
         } else if (id.find("iron") != std::string_view::npos) {
             u = half ? 54 : 63;
         } else if (id.find("copper") != std::string_view::npos) {
-            // The original Java atlas does not define copper armor; use the
-            // neutral iron/silver sprite as a stable fallback.
-            u = half ? 54 : 63;
+            // Match Detail Armor Bar Reconstructed: copper uses the sprite
+            // at U=0/9 and V=74, with the vanilla variant shifted by +45.
+            u = half ? 0 : 9;
+            v = 74;
         }
     }
 
