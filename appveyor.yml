@@ -1,4 +1,3 @@
-
 image: Visual Studio 2022
 clone_depth: 1
 skip_branch_with_pr: false
@@ -444,36 +443,74 @@ build_script:
               -Force
       }
 
-      # Package the Java atlas in the ZIP layout expected by
-      # MinecraftUIRenderContext::getZippedTexture("textures/armor_bar").
+      # Package the Java armor atlas and trim with canonical ZIP entry names.
+      # Keep this archive layout compatible with getZippedTexture("textures/armor_bar").
       $atlasSource = Join-Path $repo 'resources/java-reference/textures/armor_bar.png'
+      $trimSource = Join-Path $repo 'resources/java-reference/textures/armor_trim.png'
+
       if (-not (Test-Path -LiteralPath $atlasSource)) {
           throw "Required armor atlas is missing: $atlasSource"
+      }
+
+      if (-not (Test-Path -LiteralPath $trimSource)) {
+          throw "Required armor trim texture is missing: $trimSource"
       }
 
       $resources = Join-Path $dist 'resources'
       New-Item -ItemType Directory -Force -Path $resources | Out-Null
 
-      $atlasStage = Join-Path $repo '.ci-tools\DetailArmorBarBedrock-atlas-stage'
-      if (Test-Path -LiteralPath $atlasStage) {
-          Remove-Item -LiteralPath $atlasStage -Recurse -Force
-      }
-      $atlasTextures = Join-Path $atlasStage 'textures'
-      New-Item -ItemType Directory -Force -Path $atlasTextures | Out-Null
-      Copy-Item `
-          -LiteralPath $atlasSource `
-          -Destination (Join-Path $atlasTextures 'armor_bar.png') `
-          -Force
-
       $atlasZip = Join-Path $resources 'DetailArmorBarBedrockTextures.zip'
       if (Test-Path -LiteralPath $atlasZip) {
           Remove-Item -LiteralPath $atlasZip -Force
       }
-      Compress-Archive `
-          -Path (Join-Path $atlasStage 'textures') `
-          -DestinationPath $atlasZip `
-          -Force
-      Remove-Item -LiteralPath $atlasStage -Recurse -Force
+
+      Add-Type -AssemblyName System.IO.Compression
+      Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+      $archive = [System.IO.Compression.ZipFile]::Open(
+          $atlasZip,
+          [System.IO.Compression.ZipArchiveMode]::Create
+      )
+
+      try {
+          [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+              $archive,
+              $atlasSource,
+              'textures/armor_bar.png',
+              [System.IO.Compression.CompressionLevel]::Optimal
+          ) | Out-Null
+
+          [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+              $archive,
+              $trimSource,
+              'textures/armor_trim.png',
+              [System.IO.Compression.CompressionLevel]::Optimal
+          ) | Out-Null
+      }
+      finally {
+          $archive.Dispose()
+      }
+
+      # Verify the actual ZIP entries after closing the archive.
+      $verifyArchive = [System.IO.Compression.ZipFile]::OpenRead($atlasZip)
+      try {
+          $entryNames = @(
+              $verifyArchive.Entries | ForEach-Object { $_.FullName }
+          )
+
+          if ($entryNames -cnotcontains 'textures/armor_bar.png') {
+              throw 'Atlas ZIP verification failed: textures/armor_bar.png is missing.'
+          }
+
+          if ($entryNames -cnotcontains 'textures/armor_trim.png') {
+              throw 'Atlas ZIP verification failed: textures/armor_trim.png is missing.'
+          }
+      }
+      finally {
+          $verifyArchive.Dispose()
+      }
+
+      Write-Host 'Armor atlas ZIP entries verified: textures/armor_bar.png, textures/armor_trim.png'
 
       # Manifest paket mod. Write UTF-8 without BOM because the BMCBL
       # manifest reader rejects a BOM at byte zero (expected value at line 1 column 1).
