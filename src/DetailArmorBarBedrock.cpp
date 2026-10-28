@@ -5,6 +5,8 @@
 #include "ll/api/event/render/UIRenderEvent.h"
 #include "ui/SettingsMenu.h"
 #include "render/ArmorHudRenderer.h"
+#include "mc/client/game/IClientInstance.h"
+#include "mc/client/player/LocalPlayer.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
